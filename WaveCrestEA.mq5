@@ -149,7 +149,7 @@ double lastLoggedNow_hist = 0.0;
 bool trailingStopActive = false;
 double lastTrailingStopPrice = 0.0;
 datetime lastProcessedCandleForTrailing = 0;
-double lastHighLow = 0.0;
+double lastTrackingLevel = 0.0;
 
 // --------------------------- HELPERS --------------------------------
 double PointSize() { return(SymbolInfoDouble(_Symbol, SYMBOL_POINT)); }
@@ -758,7 +758,7 @@ int OnInit()
    trailingStopActive = false;
    lastTrailingStopPrice = 0.0;
    lastProcessedCandleForTrailing = 0;
-   lastHighLow = 0.0;
+   lastTrackingLevel = 0.0;
 
    OpenDebugFiles();
 
@@ -839,7 +839,7 @@ void ProcessTrailingStop()
       // Reset trailing stop state when no position
       trailingStopActive = false;
       lastTrailingStopPrice = 0.0;
-      lastHighLow = 0.0;
+      lastTrackingLevel = 0.0;
       return;
    }
    
@@ -883,14 +883,14 @@ void ProcessTrailingStop()
       if(currentProfit >= profitThreshold)
       {
          trailingStopActive = true;
-         lastHighLow = (posType == POSITION_TYPE_BUY) ? rates[1].low : rates[1].high;
+         lastTrackingLevel = (posType == POSITION_TYPE_BUY) ? rates[1].low : rates[1].high;
          
          // Immediately set trailing stop at ATR distance from current low/high
          double newSL = 0.0;
          if(posType == POSITION_TYPE_BUY)
-            newSL = lastHighLow - atrDistance;
+            newSL = lastTrackingLevel - atrDistance;
          else
-            newSL = lastHighLow + atrDistance;
+            newSL = lastTrackingLevel + atrDistance;
          
          // Only update if new SL is better than current SL
          bool shouldUpdate = false;
@@ -914,7 +914,7 @@ void ProcessTrailingStop()
             if(PrintTradeInfo) 
                PrintFormat("WaveCrestEA: Trailing stop ACTIVATED (no SL update needed). Profit=%.5f >= Threshold=%.5f", currentProfit, profitThreshold);
          }
-         return; // Don't check for new higher/lower on same candle where we activate
+         return; // Activation complete for this candle - prevent immediate re-adjustment
       }
       else
       {
@@ -931,7 +931,7 @@ void ProcessTrailingStop()
       // For buy positions: look for higher lows
       double currentLow = rates[1].low;
       
-      if(lastHighLow == 0.0 || currentLow > lastHighLow)
+      if(lastTrackingLevel == 0.0 || currentLow > lastTrackingLevel)
       {
          // New higher low identified
          newSL = currentLow - atrDistance;
@@ -940,7 +940,7 @@ void ProcessTrailingStop()
          if(newSL > posSL)
          {
             shouldUpdateSL = true;
-            lastHighLow = currentLow;
+            lastTrackingLevel = currentLow;
             if(PrintTradeInfo)
                PrintFormat("WaveCrestEA: BUY - New higher low=%.5f, New SL=%.5f (Old SL=%.5f)", currentLow, newSL, posSL);
          }
@@ -951,7 +951,7 @@ void ProcessTrailingStop()
       // For sell positions: look for lower highs
       double currentHigh = rates[1].high;
       
-      if(lastHighLow == 0.0 || currentHigh < lastHighLow)
+      if(lastTrackingLevel == 0.0 || currentHigh < lastTrackingLevel)
       {
          // New lower high identified
          newSL = currentHigh + atrDistance;
@@ -960,7 +960,7 @@ void ProcessTrailingStop()
          if(posSL == 0.0 || newSL < posSL)
          {
             shouldUpdateSL = true;
-            lastHighLow = currentHigh;
+            lastTrackingLevel = currentHigh;
             if(PrintTradeInfo)
                PrintFormat("WaveCrestEA: SELL - New lower high=%.5f, New SL=%.5f (Old SL=%.5f)", currentHigh, newSL, posSL);
          }
