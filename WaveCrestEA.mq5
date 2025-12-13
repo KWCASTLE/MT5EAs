@@ -77,6 +77,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 
 bool WaitForMacdMainAndSignal(int closedOffset, int needCount, int maxAttempts, int sleepMs);
 string TimeStampOrNA(datetime t);
+void ProcessTrailingStop();
 // --------------------------------------------------------------------
 
 // --------------------------- INPUTS --------------------------------
@@ -114,6 +115,9 @@ input bool   UseTestDateRange = false;
 input datetime TestFromDate = D'2025.08.01 00:00';
 input datetime TestToDate   = D'2025.11.10 23:59';
 
+input bool   ATR_TrailingStop_Enabled = true;
+input double ATR_ProfitThreshold_Multiplier = 1.0;
+
 // --------------------------- DEBUG FILE NAMES -----------------------
 string DEBUG_FILENAME  = "wavecrest_debug_struct.csv";
 string RAW_FILENAME    = "wavecrest_debug_raw.txt";
@@ -141,6 +145,11 @@ datetime lastLoggedNowTime = 0;
 double lastLoggedNow_main = 0.0;
 double lastLoggedNow_signal = 0.0;
 double lastLoggedNow_hist = 0.0;
+
+bool trailingStopActive = false;
+double lastTrailingStopPrice = 0.0;
+datetime lastProcessedCandleForTrailing = 0;
+double lastHighLow = 0.0;
 
 // --------------------------- HELPERS --------------------------------
 double PointSize() { return(SymbolInfoDouble(_Symbol, SYMBOL_POINT)); }
@@ -745,6 +754,11 @@ int OnInit()
    lastProcessedBarTime = 0;
    barsSinceLastEntry = 9999;
    consecutiveLosses = 0;
+   
+   trailingStopActive = false;
+   lastTrailingStopPrice = 0.0;
+   lastProcessedCandleForTrailing = 0;
+   lastHighLow = 0.0;
 
    OpenDebugFiles();
 
@@ -764,9 +778,9 @@ int OnInit()
 
    EventSetTimer(1);
 
-   PrintFormat("WaveCrestEA DIAG: Initialized. MACD(%d,%d,%d) UseTestDateRange=%d From=%s To=%s UseCarryPrev=%d DisablePredictor=%d MinOrderingGap=%.8g ForcePassOrderingGap=%d ForceMinLots=%.8g RndOverride=%d",
+   PrintFormat("WaveCrestEA DIAG: Initialized. MACD(%d,%d,%d) UseTestDateRange=%d From=%s To=%s UseCarryPrev=%d DisablePredictor=%d MinOrderingGap=%.8g ForcePassOrderingGap=%d ForceMinLots=%.8g RndOverride=%d TrailingStop=%d ProfitThreshold=%.2f",
                MACD_Fast, MACD_Slow, MACD_Signal, UseTestDateRange?1:0, TimeToString(TestFromDate, TIME_DATE|TIME_SECONDS), TimeToString(TestToDate, TIME_DATE|TIME_SECONDS),
-               UseCarryPrev?1:0, DisablePredictor?1:0, MinOrderingGap, ForcePassOrderingGap?1:0, ForceMinLots, RoundingDigitsOverride);
+               UseCarryPrev?1:0, DisablePredictor?1:0, MinOrderingGap, ForcePassOrderingGap?1:0, ForceMinLots, RoundingDigitsOverride, ATR_TrailingStop_Enabled?1:0, ATR_ProfitThreshold_Multiplier);
    return(INIT_SUCCEEDED);
 }
 
@@ -811,6 +825,134 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    {
       if(consecutiveLosses != 0) PrintFormat("WaveCrestEA DIAG: Win/BE deal profit=%.8g resetting consecutiveLosses %d->0", profit, consecutiveLosses);
       consecutiveLosses = 0;
+   }
+}
+
+// --------------------------- TRAILING STOP LOGIC ---------------------
+void ProcessTrailingStop()
+{
+   if(!ATR_TrailingStop_Enabled) return;
+   
+   // Check if we have an open position
+   if(!PositionSelect(_Symbol)) 
+   {
+      // Reset trailing stop state when no position
+      trailingStopActive = false;
+      lastTrailingStopPrice = 0.0;
+      lastHighLow = 0.0;
+      return;
+   }
+   
+   // Get position details
+   ulong posTicket = PositionGetInteger(POSITION_TICKET);
+   long posType = PositionGetInteger(POSITION_TYPE);
+   double posOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double posSL = PositionGetDouble(POSITION_SL);
+   double currentPrice = (posType == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   // Get current closed bar time to ensure we only update once per candle
+   MqlRates rates[];
+   if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 2, rates) < 2) return;
+   datetime closedBarTime = rates[1].time;
+   
+   // Only process once per closed candle
+   if(closedBarTime == lastProcessedCandleForTrailing) return;
+   lastProcessedCandleForTrailing = closedBarTime;
+   
+   // Get ATR value
+   double atr = 0.0;
+   if(atrHandle != INVALID_HANDLE)
+   {
+      double atrBuf[];
+      if(CopyBuffer(atrHandle, 0, 1, 1, atrBuf) > 0) atr = atrBuf[0];
+   }
+   if(atr <= 0.0) return;
+   
+   double atrDistance = atr * ATR_Multiplier;
+   double profitThreshold = atr * ATR_ProfitThreshold_Multiplier;
+   
+   // Check if profit threshold has been met to activate trailing stop
+   if(!trailingStopActive)
+   {
+      double currentProfit = 0.0;
+      if(posType == POSITION_TYPE_BUY)
+         currentProfit = currentPrice - posOpenPrice;
+      else
+         currentProfit = posOpenPrice - currentPrice;
+      
+      if(currentProfit >= profitThreshold)
+      {
+         trailingStopActive = true;
+         lastHighLow = (posType == POSITION_TYPE_BUY) ? rates[1].low : rates[1].high;
+         if(PrintTradeInfo) 
+            PrintFormat("WaveCrestEA: Trailing stop ACTIVATED. Profit=%.5f >= Threshold=%.5f", currentProfit, profitThreshold);
+      }
+      else
+      {
+         return; // Don't activate trailing stop yet
+      }
+   }
+   
+   // Trailing stop is active - check for new higher lows (buy) or lower highs (sell)
+   double newSL = 0.0;
+   bool shouldUpdateSL = false;
+   
+   if(posType == POSITION_TYPE_BUY)
+   {
+      // For buy positions: look for higher lows
+      double currentLow = rates[1].low;
+      
+      if(lastHighLow == 0.0 || currentLow > lastHighLow)
+      {
+         // New higher low identified
+         newSL = currentLow - atrDistance;
+         
+         // Only move SL up (in profit direction), never down
+         if(newSL > posSL)
+         {
+            shouldUpdateSL = true;
+            lastHighLow = currentLow;
+            if(PrintTradeInfo)
+               PrintFormat("WaveCrestEA: BUY - New higher low=%.5f, New SL=%.5f (Old SL=%.5f)", currentLow, newSL, posSL);
+         }
+      }
+   }
+   else // POSITION_TYPE_SELL
+   {
+      // For sell positions: look for lower highs
+      double currentHigh = rates[1].high;
+      
+      if(lastHighLow == 0.0 || currentHigh < lastHighLow)
+      {
+         // New lower high identified
+         newSL = currentHigh + atrDistance;
+         
+         // Only move SL down (in profit direction), never up
+         if(posSL == 0.0 || newSL < posSL)
+         {
+            shouldUpdateSL = true;
+            lastHighLow = currentHigh;
+            if(PrintTradeInfo)
+               PrintFormat("WaveCrestEA: SELL - New lower high=%.5f, New SL=%.5f (Old SL=%.5f)", currentHigh, newSL, posSL);
+         }
+      }
+   }
+   
+   // Update stop loss if needed
+   if(shouldUpdateSL)
+   {
+      double posTP = PositionGetDouble(POSITION_TP);
+      if(trade.PositionModify(posTicket, newSL, posTP))
+      {
+         lastTrailingStopPrice = newSL;
+         if(PrintTradeInfo)
+            PrintFormat("WaveCrestEA: Trailing stop UPDATED to %.5f", newSL);
+      }
+      else
+      {
+         if(PrintTradeInfo)
+            PrintFormat("WaveCrestEA: Failed to update trailing stop. Error=%d", GetLastError());
+      }
    }
 }
 
@@ -1087,5 +1229,8 @@ void OnTick()
    }
 
    barsSinceLastEntry++;
+   
+   // Process trailing stop mechanism
+   ProcessTrailingStop();
 }
 //+------------------------------------------------------------------+
