@@ -1,14 +1,15 @@
 //+------------------------------------------------------------------+
-//| WaveCrestEA v1.87 - ensure magnitude-based ordering comparisons  |
+//| WaveCrestEA v1.88 - ATR-based trailing stop mechanism            |
 //| - Use MathAbs(...) for ordering / overshoot comparisons (magnitude)
 //| - Use only sign of main & hist to decide buy vs sell (positive=>sell, negative=>buy)
 //| - Make init snapshot symmetric for buy and sell emergences
 //| - Keep predictor / residual / hist magnitude / RSI gating intact
 //| - Treat non-positive internal eps_input as "use MinOrderingGap"
 //| - Add temporary testing toggles: ForcePassOrderingGap, ForceMinLots
+//| - ATR-based trailing stop with profit threshold and support/resistance tracking
 //+------------------------------------------------------------------+
 #property copyright "WaveCrestEA"
-#property version   "1.87"
+#property version   "1.88"
 #property strict
 
 #include <Trade\Trade.mqh>
