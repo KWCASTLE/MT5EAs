@@ -884,8 +884,37 @@ void ProcessTrailingStop()
       {
          trailingStopActive = true;
          lastHighLow = (posType == POSITION_TYPE_BUY) ? rates[1].low : rates[1].high;
-         if(PrintTradeInfo) 
-            PrintFormat("WaveCrestEA: Trailing stop ACTIVATED. Profit=%.5f >= Threshold=%.5f", currentProfit, profitThreshold);
+         
+         // Immediately set trailing stop at ATR distance from current low/high
+         double newSL = 0.0;
+         if(posType == POSITION_TYPE_BUY)
+            newSL = lastHighLow - atrDistance;
+         else
+            newSL = lastHighLow + atrDistance;
+         
+         // Only update if new SL is better than current SL
+         bool shouldUpdate = false;
+         if(posType == POSITION_TYPE_BUY && newSL > posSL)
+            shouldUpdate = true;
+         else if(posType == POSITION_TYPE_SELL && (posSL == 0.0 || newSL < posSL))
+            shouldUpdate = true;
+         
+         if(shouldUpdate)
+         {
+            double posTP = PositionGetDouble(POSITION_TP);
+            if(trade.PositionModify(posTicket, newSL, posTP))
+            {
+               lastTrailingStopPrice = newSL;
+               if(PrintTradeInfo) 
+                  PrintFormat("WaveCrestEA: Trailing stop ACTIVATED and set to %.5f. Profit=%.5f >= Threshold=%.5f", newSL, currentProfit, profitThreshold);
+            }
+         }
+         else
+         {
+            if(PrintTradeInfo) 
+               PrintFormat("WaveCrestEA: Trailing stop ACTIVATED (no SL update needed). Profit=%.5f >= Threshold=%.5f", currentProfit, profitThreshold);
+         }
+         return; // Don't check for new higher/lower on same candle where we activate
       }
       else
       {
