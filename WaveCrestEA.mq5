@@ -71,7 +71,6 @@ bool PlaceOrder(bool isBuy, double lots, double sl, double tp, string comment);
 
 void InitTrailingStopForPosition(ulong ticket, double entryPrice, bool isBuy);
 void UpdateTrailingStop(const MqlRates &lastClosedBar, double atr);
-void CheckAndActivateTrailingStop();
 
 int  OnInit();
 void OnDeinit(const int reason);
@@ -304,8 +303,8 @@ void UpdateTrailingStop(const MqlRates &lastClosedBar, double atr)
    }
    else
    {
-      // For sell positions, track lowest low
-      if(trailingStopBestPrice == trailingStopEntryPrice || lastClosedBar.low < trailingStopBestPrice)
+      // For sell positions, track lowest low (most favorable price for sell = lowest price)
+      if(lastClosedBar.low < trailingStopBestPrice)
       {
          trailingStopBestPrice = lastClosedBar.low;
          if(PrintTradeInfo)
