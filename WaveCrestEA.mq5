@@ -69,6 +69,12 @@ double CalcLotsByRisk(double entryPrice, double stopPrice, double riskPercent);
 double CalcLotsForEntry(double entry, double stop);
 bool PlaceOrder(bool isBuy, double lots, double sl, double tp, string comment);
 
+void ManageTrailingStops();
+void UpdateTrailingStopForPosition(ulong ticket);
+int FindTrailingStopIndex(ulong ticket);
+void AddTrailingStop(ulong ticket);
+void RemoveTrailingStop(int index);
+
 int  OnInit();
 void OnDeinit(const int reason);
 void OnTimer();
@@ -87,6 +93,11 @@ input int    ATR_Period  = 14;
 input double ATR_Multiplier = 1.5;
 input double TP_Multiplier  = 2.0;
 input double RiskPercentPerTrade = 0.5;
+
+// Trailing Stop inputs
+input bool   UseTrailingStop = true;
+input double TrailingStop_ATR_Multiplier = 1.5;
+input double TrailingStop_Activation_ATR_Multiplier = 1.0;
 input double FixedLotForTesting  = 0.0;
 input double MinLot = 0.01;
 input int    MaxDoublings = 5;
@@ -141,6 +152,17 @@ datetime lastLoggedNowTime = 0;
 double lastLoggedNow_main = 0.0;
 double lastLoggedNow_signal = 0.0;
 double lastLoggedNow_hist = 0.0;
+
+// Trailing stop tracking variables
+struct TrailingStopInfo
+{
+   ulong ticket;
+   bool isActive;
+   double activationPrice;
+   double lastBarClose;
+};
+TrailingStopInfo trailingStops[];
+int trailingStopsCount = 0;
 
 // --------------------------- HELPERS --------------------------------
 double PointSize() { return(SymbolInfoDouble(_Symbol, SYMBOL_POINT)); }
@@ -495,6 +517,195 @@ void WriteInitSnapshot()
    WriteToAllFiles(decCsv, decRaw);
 }
 
+// --------------------------- TRAILING STOP MANAGEMENT ---------------
+int FindTrailingStopIndex(ulong ticket)
+{
+   for(int i=0; i<trailingStopsCount; i++)
+   {
+      if(trailingStops[i].ticket == ticket) return i;
+   }
+   return -1;
+}
+
+void AddTrailingStop(ulong ticket)
+{
+   int index = FindTrailingStopIndex(ticket);
+   if(index >= 0) return; // Already tracking
+   
+   ArrayResize(trailingStops, trailingStopsCount + 1);
+   trailingStops[trailingStopsCount].ticket = ticket;
+   trailingStops[trailingStopsCount].isActive = false;
+   trailingStops[trailingStopsCount].activationPrice = 0.0;
+   trailingStops[trailingStopsCount].lastBarClose = 0.0;
+   trailingStopsCount++;
+   
+   if(PrintTradeInfo) PrintFormat("WaveCrestEA: Added trailing stop tracking for ticket %llu", ticket);
+}
+
+void RemoveTrailingStop(int index)
+{
+   if(index < 0 || index >= trailingStopsCount) return;
+   
+   ulong removedTicket = trailingStops[index].ticket;
+   
+   // Shift elements down
+   for(int i=index; i<trailingStopsCount-1; i++)
+   {
+      trailingStops[i] = trailingStops[i+1];
+   }
+   trailingStopsCount--;
+   ArrayResize(trailingStops, trailingStopsCount);
+   
+   if(PrintTradeInfo) PrintFormat("WaveCrestEA: Removed trailing stop tracking for ticket %llu", removedTicket);
+}
+
+void UpdateTrailingStopForPosition(ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket)) return;
+   
+   string posSymbol = PositionGetString(POSITION_SYMBOL);
+   if(posSymbol != _Symbol) return;
+   
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double posOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double posSL = PositionGetDouble(POSITION_SL);
+   
+   // Get current close price (of the last closed bar)
+   MqlRates rates[];
+   if(CopyRates(_Symbol, PERIOD_CURRENT, 1, 2, rates) < 2) return;
+   double currentClose = rates[0].close;
+   
+   // Get current ATR
+   double atr = 0.0;
+   if(atrHandle != INVALID_HANDLE)
+   {
+      double atrBuf[];
+      int ac = CopyBuffer(atrHandle, 0, 1, 1, atrBuf);
+      if(ac > 0) atr = atrBuf[0];
+   }
+   if(atr <= 0.0) return; // Can't trail without ATR
+   
+   int index = FindTrailingStopIndex(ticket);
+   if(index < 0) return; // Not tracking this position
+   
+   // Check if trailing stop should be activated
+   if(!trailingStops[index].isActive)
+   {
+      double profitDistance = 0.0;
+      if(posType == POSITION_TYPE_BUY)
+         profitDistance = currentClose - posOpenPrice;
+      else
+         profitDistance = posOpenPrice - currentClose;
+      
+      double activationThreshold = atr * TrailingStop_Activation_ATR_Multiplier;
+      
+      if(profitDistance >= activationThreshold)
+      {
+         trailingStops[index].isActive = true;
+         trailingStops[index].activationPrice = currentClose;
+         trailingStops[index].lastBarClose = currentClose;
+         if(PrintTradeInfo) PrintFormat("WaveCrestEA: Trailing stop activated for ticket %llu at price %.5f (profit %.5f >= threshold %.5f)", 
+                                        ticket, currentClose, profitDistance, activationThreshold);
+      }
+      else
+      {
+         return; // Not yet profitable enough to activate
+      }
+   }
+   
+   // Trailing stop is active - adjust if needed
+   double trailDistance = atr * TrailingStop_ATR_Multiplier;
+   double newSL = 0.0;
+   bool shouldUpdate = false;
+   
+   if(posType == POSITION_TYPE_BUY)
+   {
+      // For BUY: Move SL up based on candle close, maintaining ATR distance
+      // Calculate potential new SL based on current close
+      newSL = currentClose - trailDistance;
+      
+      // Only move SL up, never down
+      if(newSL > posSL)
+      {
+         shouldUpdate = true;
+      }
+   }
+   else // POSITION_TYPE_SELL
+   {
+      // For SELL: Move SL down based on candle close, maintaining ATR distance
+      // Calculate potential new SL based on current close
+      newSL = currentClose + trailDistance;
+      
+      // Only move SL down, never up (for sell, down means better SL)
+      if(newSL < posSL || posSL == 0.0)
+      {
+         shouldUpdate = true;
+      }
+   }
+   
+   // Update the stop loss if needed
+   if(shouldUpdate)
+   {
+      bool result = trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+      if(result)
+      {
+         if(PrintTradeInfo) PrintFormat("WaveCrestEA: Updated trailing SL for ticket %llu: %.5f -> %.5f (close=%.5f)", 
+                                        ticket, posSL, newSL, currentClose);
+         trailingStops[index].lastBarClose = currentClose;
+      }
+      else
+      {
+         int err = GetLastError();
+         PrintFormat("WaveCrestEA: Failed to update trailing SL for ticket %llu, error=%d", ticket, err);
+      }
+   }
+   else
+   {
+      // Still update lastBarClose for tracking even if we don't modify SL
+      trailingStops[index].lastBarClose = currentClose;
+   }
+}
+
+void ManageTrailingStops()
+{
+   if(!UseTrailingStop) return;
+   
+   // First, remove tracking for closed positions
+   for(int i=trailingStopsCount-1; i>=0; i--)
+   {
+      if(!PositionSelectByTicket(trailingStops[i].ticket))
+      {
+         RemoveTrailingStop(i);
+      }
+   }
+   
+   // Then, ensure all open positions are tracked
+   int totalPos = PositionsTotal();
+   for(int i=0; i<totalPos; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(!PositionSelectByTicket(ticket)) continue;
+         string posSymbol = PositionGetString(POSITION_SYMBOL);
+         if(posSymbol == _Symbol)
+         {
+            int index = FindTrailingStopIndex(ticket);
+            if(index < 0)
+            {
+               AddTrailingStop(ticket);
+            }
+         }
+      }
+   }
+   
+   // Finally, update trailing stops for all tracked positions
+   for(int i=0; i<trailingStopsCount; i++)
+   {
+      UpdateTrailingStopForPosition(trailingStops[i].ticket);
+   }
+}
+
 // --------------------------- BATCH PROCESSING -----------------------
 void BatchProcessRange(datetime from_time, datetime to_time)
 {
@@ -745,6 +956,10 @@ int OnInit()
    lastProcessedBarTime = 0;
    barsSinceLastEntry = 9999;
    consecutiveLosses = 0;
+   
+   // Initialize trailing stops
+   ArrayResize(trailingStops, 0);
+   trailingStopsCount = 0;
 
    OpenDebugFiles();
 
@@ -1079,6 +1294,29 @@ void OnTick()
          PrintFormat("WaveCrestEA: ORDER_PLACED %s lots=%.2f", (isBuy? "BUY":"SELL"), lots);
          barsSinceLastEntry = 0;
          look_for = 0;
+         
+         // Add trailing stop tracking for the new position
+         if(UseTrailingStop)
+         {
+            // Find the position that was just opened
+            int totalPos = PositionsTotal();
+            for(int i=0; i<totalPos; i++)
+            {
+               ulong ticket = PositionGetTicket(i);
+               if(ticket > 0 && PositionSelectByTicket(ticket))
+               {
+                  string posSymbol = PositionGetString(POSITION_SYMBOL);
+                  if(posSymbol == _Symbol)
+                  {
+                     // Check if this is a new position we're not tracking yet
+                     if(FindTrailingStopIndex(ticket) < 0)
+                     {
+                        AddTrailingStop(ticket);
+                     }
+                  }
+               }
+            }
+         }
       }
       else
       {
@@ -1087,5 +1325,8 @@ void OnTick()
    }
 
    barsSinceLastEntry++;
+   
+   // Manage trailing stops at bar close
+   ManageTrailingStops();
 }
 //+------------------------------------------------------------------+
