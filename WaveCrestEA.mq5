@@ -97,7 +97,7 @@ input double LossMultiplier = 2.0;
 input int    RSI_Period = 14;
 input double RSI_Buy_Threshold = 45.0;
 input double RSI_Sell_Threshold = 55.0;
-input double GapPct = 0.01;  // Market-adaptive gap as percentage of ATR (replaces HistOvershootThreshold)
+input double GapPct = 0.01;  // Market-adaptive gap as decimal multiplier of ATR (0.01 = 1% of ATR, replaces HistOvershootThreshold)
 input int    MinBarsBetweenSignals = 3;
 input int    Emergence_RequiredBars = 2;
 input double Emergence_kResidual = 1.0;
@@ -153,6 +153,9 @@ double lastLoggedNow_main = 0.0;
 double lastLoggedNow_signal = 0.0;
 double lastLoggedNow_hist = 0.0;
 
+// --------------------------- CONSTANTS ------------------------------
+#define MIN_EPSILON_THRESHOLD 1e-5   // Minimum epsilon threshold as point size multiplier
+
 // --------------------------- HELPERS --------------------------------
 double PointSize() { return(SymbolInfoDouble(_Symbol, SYMBOL_POINT)); }
 
@@ -160,7 +163,7 @@ double ComputeEpsilon(double atr)
 {
    // Market-adaptive: use GapPct of ATR as threshold
    double adaptiveThreshold = (atr > 0.0) ? (GapPct * atr) : (PointSize() * 1.0);
-   return MathMax(adaptiveThreshold, PointSize() * 1e-5);
+   return MathMax(adaptiveThreshold, PointSize() * MIN_EPSILON_THRESHOLD);
 }
 
 double NormalizeLots(double lots)
@@ -235,7 +238,8 @@ bool PlaceOrder(bool isBuy, double lots, double sl, double tp, string comment)
             ulong dealTicket = trade.ResultDeal();
             if(dealTicket > 0)
             {
-               HistorySelect(TimeCurrent() - 60, TimeCurrent());
+               // Extended history selection range to handle slow markets or execution delays
+               HistorySelect(TimeCurrent() - 300, TimeCurrent());  // 5 minutes
                if(HistoryDealSelect(dealTicket))
                {
                   ulong posTicket = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
@@ -260,6 +264,14 @@ bool PlaceOrder(bool isBuy, double lots, double sl, double tp, string comment)
 void InitTrailingStopForPosition(ulong ticket, double entryPrice, bool isBuy)
 {
    if(!EnableTrailingStop) return;
+   
+   // Warn if we're replacing an active trailing stop (EA designed for single position)
+   if(trailingStopActive && trailingStopTicket != ticket)
+   {
+      if(PrintTradeInfo)
+         PrintFormat("WaveCrestEA: Warning - Replacing trailing stop for position #%I64u with #%I64u", 
+                     trailingStopTicket, ticket);
+   }
    
    trailingStopActive = true;
    trailingStopTicket = ticket;
@@ -313,6 +325,8 @@ void UpdateTrailingStop(const MqlRates &lastClosedBar, double atr)
    }
    
    // Check minimum improvement threshold before activating trailing stop
+   // Note: This uses mid-price (high/low) rather than bid/ask. In high-spread environments,
+   // consider adjusting MinImprovementMult to account for spread impact on actual profit.
    double improvement = isBuy ? (trailingStopBestPrice - trailingStopEntryPrice) : (trailingStopEntryPrice - trailingStopBestPrice);
    double minImprovement = MinImprovementMult * atr;
    
