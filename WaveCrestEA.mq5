@@ -1,14 +1,14 @@
 //+------------------------------------------------------------------+
-//| WaveCrestEA v1.87 - ensure magnitude-based ordering comparisons  |
-//| - Use MathAbs(...) for ordering / overshoot comparisons (magnitude)
-//| - Use only sign of main & hist to decide buy vs sell (positive=>sell, negative=>buy)
-//| - Make init snapshot symmetric for buy and sell emergences
-//| - Keep predictor / residual / hist magnitude / RSI gating intact
-//| - Treat non-positive internal eps_input as "use MinOrderingGap"
-//| - Add temporary testing toggles: ForcePassOrderingGap, ForceMinLots
+//| WaveCrestEA v1.88 - ATR-based trailing stop implementation      |
+//| - Added trailing stop mechanism with higher lows (buy) / lower highs (sell)
+//| - Trailing stop only moves toward profit, never backward
+//| - Minimum improvement threshold before trailing stop activation
+//| - All adjustments occur on candle closure (not tick-by-tick)
+//| - Removed obsolete testing inputs (ForcePassOrderingGap, ForceMinLots)
+//| - Made HistOvershootThreshold market-adaptive (uses ATR)
 //+------------------------------------------------------------------+
 #property copyright "WaveCrestEA"
-#property version   "1.87"
+#property version   "1.88"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -69,6 +69,10 @@ double CalcLotsByRisk(double entryPrice, double stopPrice, double riskPercent);
 double CalcLotsForEntry(double entry, double stop);
 bool PlaceOrder(bool isBuy, double lots, double sl, double tp, string comment);
 
+void InitTrailingStopForPosition(ulong ticket, double entryPrice, bool isBuy);
+void UpdateTrailingStop(const MqlRates &lastClosedBar, double atr);
+void CheckAndActivateTrailingStop();
+
 int  OnInit();
 void OnDeinit(const int reason);
 void OnTimer();
@@ -94,7 +98,7 @@ input double LossMultiplier = 2.0;
 input int    RSI_Period = 14;
 input double RSI_Buy_Threshold = 45.0;
 input double RSI_Sell_Threshold = 55.0;
-input double HistOvershootThreshold = 0.00001;
+input double GapPct = 0.01;  // Market-adaptive gap as percentage of ATR (replaces HistOvershootThreshold)
 input int    MinBarsBetweenSignals = 3;
 input int    Emergence_RequiredBars = 2;
 input double Emergence_kResidual = 1.0;
@@ -102,11 +106,13 @@ input double MinHistAbsMult = 1.0;
 input bool   PrintTradeInfo = true;
 input int    MaxRetriesOnSend = 1;
 
+input bool   EnableTrailingStop = true;      // Enable/disable trailing stop functionality
+input double MinImprovementMult = 1.0;       // Minimum profit improvement (in ATR) before trailing stop activates
+input double TrailingStopATRMult = 1.0;      // ATR multiplier for trailing stop distance
+
 input bool   UseCarryPrev = true;
 input bool   DisablePredictor = false;
 input double MinOrderingGap = 0.00005;
-input bool   ForcePassOrderingGap = false;   // TEMP: bypass ordering gap for testing
-input double ForceMinLots = 0.0;            // TEMP: if >0 and computed lots round to 0, use this for testing
 input int    RoundingDigitsOverride = 0;
 input bool   ForceIndicatorAppliedPriceClose = true;
 
@@ -128,6 +134,12 @@ int barsSinceLastEntry = 9999;
 int look_for = 0;
 int consecutiveLosses = 0;
 
+// Trailing stop state tracking
+double trailingStopEntryPrice = 0.0;      // Entry price of tracked position
+double trailingStopBestPrice = 0.0;       // Best price achieved (highest high for buy, lowest low for sell)
+bool trailingStopActive = false;          // Whether trailing stop is tracking a position
+ulong trailingStopTicket = 0;             // Ticket of tracked position
+
 int fh_local_struct = INVALID_HANDLE;
 int fh_local_raw    = INVALID_HANDLE;
 int fh_common_struct = INVALID_HANDLE;
@@ -147,8 +159,9 @@ double PointSize() { return(SymbolInfoDouble(_Symbol, SYMBOL_POINT)); }
 
 double ComputeEpsilon(double atr)
 {
-   if(atr > 0.0) return MathMax(HistOvershootThreshold, 0.01 * atr);
-   return MathMax(HistOvershootThreshold, PointSize()*1.0);
+   // Market-adaptive: use GapPct of ATR as threshold
+   double adaptiveThreshold = (atr > 0.0) ? (GapPct * atr) : (PointSize() * 1.0);
+   return MathMax(adaptiveThreshold, PointSize() * 1e-5);
 }
 
 double NormalizeLots(double lots)
@@ -214,12 +227,159 @@ bool PlaceOrder(bool isBuy, double lots, double sl, double tp, string comment)
    {
       if(isBuy) ok = trade.Buy(lots, _Symbol, 0.0, sl, tp, comment);
       else      ok = trade.Sell(lots, _Symbol, 0.0, sl, tp, comment);
-      if(ok) return true;
+      if(ok)
+      {
+         // Initialize trailing stop tracking if enabled
+         if(EnableTrailingStop && trade.ResultOrder() > 0)
+         {
+            // Get the position ticket from the result
+            ulong dealTicket = trade.ResultDeal();
+            if(dealTicket > 0)
+            {
+               HistorySelect(TimeCurrent() - 60, TimeCurrent());
+               if(HistoryDealSelect(dealTicket))
+               {
+                  ulong posTicket = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+                  if(posTicket > 0)
+                  {
+                     double entryPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+                     InitTrailingStopForPosition(posTicket, entryPrice, isBuy);
+                  }
+               }
+            }
+         }
+         return true;
+      }
       int err = GetLastError();
       PrintFormat("WaveCrestEA: Order send failed attempt=%d err=%d", attempt, err);
       Sleep(200);
    }
    return false;
+}
+
+// --------------------------- TRAILING STOP FUNCTIONS ----------------
+void InitTrailingStopForPosition(ulong ticket, double entryPrice, bool isBuy)
+{
+   if(!EnableTrailingStop) return;
+   
+   trailingStopActive = true;
+   trailingStopTicket = ticket;
+   trailingStopEntryPrice = entryPrice;
+   trailingStopBestPrice = entryPrice; // Initialize to entry price
+   
+   if(PrintTradeInfo)
+   {
+      PrintFormat("WaveCrestEA: Trailing stop initialized for %s position #%I64u at %.5f",
+                  isBuy ? "BUY" : "SELL", ticket, entryPrice);
+   }
+}
+
+void UpdateTrailingStop(const MqlRates &lastClosedBar, double atr)
+{
+   if(!EnableTrailingStop || !trailingStopActive) return;
+   
+   // Check if position still exists
+   if(!PositionSelectByTicket(trailingStopTicket))
+   {
+      trailingStopActive = false;
+      if(PrintTradeInfo)
+         PrintFormat("WaveCrestEA: Position #%I64u no longer exists, deactivating trailing stop", trailingStopTicket);
+      return;
+   }
+   
+   long posType = PositionGetInteger(POSITION_TYPE);
+   double currentSL = PositionGetDouble(POSITION_SL);
+   bool isBuy = (posType == POSITION_TYPE_BUY);
+   
+   // Update best price achieved
+   if(isBuy)
+   {
+      // For buy positions, track highest high
+      if(lastClosedBar.high > trailingStopBestPrice)
+      {
+         trailingStopBestPrice = lastClosedBar.high;
+         if(PrintTradeInfo)
+            PrintFormat("WaveCrestEA: BUY position #%I64u - new high: %.5f", trailingStopTicket, trailingStopBestPrice);
+      }
+   }
+   else
+   {
+      // For sell positions, track lowest low
+      if(trailingStopBestPrice == trailingStopEntryPrice || lastClosedBar.low < trailingStopBestPrice)
+      {
+         trailingStopBestPrice = lastClosedBar.low;
+         if(PrintTradeInfo)
+            PrintFormat("WaveCrestEA: SELL position #%I64u - new low: %.5f", trailingStopTicket, trailingStopBestPrice);
+      }
+   }
+   
+   // Check minimum improvement threshold before activating trailing stop
+   double improvement = isBuy ? (trailingStopBestPrice - trailingStopEntryPrice) : (trailingStopEntryPrice - trailingStopBestPrice);
+   double minImprovement = MinImprovementMult * atr;
+   
+   if(improvement < minImprovement)
+   {
+      // Not enough profit yet to start trailing
+      return;
+   }
+   
+   // Calculate new stop loss based on ATR distance from best price
+   double trailingDistance = TrailingStopATRMult * atr;
+   double newSL;
+   
+   if(isBuy)
+   {
+      // For buy: SL below the highest high
+      newSL = trailingStopBestPrice - trailingDistance;
+      
+      // Only move stop loss up (toward profit), never down
+      if(currentSL > 0.0 && newSL <= currentSL)
+      {
+         return; // Don't move stop backward
+      }
+      
+      // Also ensure new SL is better than entry (above entry for buy)
+      if(newSL <= trailingStopEntryPrice)
+      {
+         return; // Don't set SL below entry
+      }
+   }
+   else
+   {
+      // For sell: SL above the lowest low
+      newSL = trailingStopBestPrice + trailingDistance;
+      
+      // Only move stop loss down (toward profit), never up
+      if(currentSL > 0.0 && newSL >= currentSL)
+      {
+         return; // Don't move stop backward
+      }
+      
+      // Also ensure new SL is better than entry (below entry for sell)
+      if(newSL >= trailingStopEntryPrice)
+      {
+         return; // Don't set SL above entry
+      }
+   }
+   
+   // Normalize the stop loss price
+   newSL = NormalizeDouble(newSL, _Digits);
+   
+   // Modify the position
+   double currentTP = PositionGetDouble(POSITION_TP);
+   if(trade.PositionModify(trailingStopTicket, newSL, currentTP))
+   {
+      if(PrintTradeInfo)
+      {
+         PrintFormat("WaveCrestEA: Trailing stop updated for %s position #%I64u - SL: %.5f -> %.5f (best: %.5f, improvement: %.5f ATR)",
+                     isBuy ? "BUY" : "SELL", trailingStopTicket, currentSL, newSL, trailingStopBestPrice, improvement / atr);
+      }
+   }
+   else
+   {
+      int err = GetLastError();
+      PrintFormat("WaveCrestEA: Failed to modify position #%I64u, error=%d", trailingStopTicket, err);
+   }
 }
 
 // --------------------------- FILE HELPERS ---------------------------
@@ -403,10 +563,10 @@ void WriteInitSnapshot()
    double eps = ComputeEpsilon(atr);
    double safeEps = MathMax(eps, PointSize()*1e-12);
 
-   double eps_input = HistOvershootThreshold;
+   // Use computed epsilon for rounding (market-adaptive)
    int roundingDigits = 1;
    if(RoundingDigitsOverride > 0) roundingDigits = RoundingDigitsOverride;
-   else if(eps_input > 0.0) roundingDigits = (int)MathMax(1.0, MathCeil(-MathLog10(eps_input)));
+   else if(eps > 0.0) roundingDigits = (int)MathMax(1.0, MathCeil(-MathLog10(eps)));
 
    double main_prev_r   = NormalizeDouble(main_prev, roundingDigits);
    double main_now_r    = NormalizeDouble(main_now, roundingDigits);
@@ -439,11 +599,9 @@ void WriteInitSnapshot()
    int mainSignalSameSign = (main_now * signal_now) > 0.0 ? 1 : 0;
    int histLargeEnough  = (MathAbs(hist_now_r) >= (MinHistAbsMult * safeEps)) ? 1 : 0;
 
-   // epsilon comparison: treat non-positive eps_input as "use MinOrderingGap"
-   double eps_compare_init;
-   if(eps_input <= 0.0) eps_compare_init = MinOrderingGap;
-   else eps_compare_init = MathMax(MathAbs(eps_input), MinOrderingGap);
-   int orderingGapLargeEnough_init = (ForcePassOrderingGap || (orderingGap > eps_compare_init)) ? 1 : 0;
+   // epsilon comparison: use market-adaptive threshold
+   double eps_compare_init = MathMax(eps, MinOrderingGap);
+   int orderingGapLargeEnough_init = (orderingGap > eps_compare_init) ? 1 : 0;
 
    string macdCsv = StringFormat("\"%s\",\"MACD_DEBUG\",signal_prev=%.8g@%s,signal_now=%.8g@%s,hist_prev=%.8g@%s,hist_now=%.8g@%s,main_prev=%.8g@%s,main_now=%.8g@%s,predicted_hist=%.8g,residual=%.8g,normResidual=%.6g,safeEps=%.8g,eps=%.8g,atr=%.8g,rsi=%.8g\r\n",
                                 ts,
@@ -483,13 +641,13 @@ void WriteInitSnapshot()
       }
    }
 
-   string notes = StringFormat("init_snapshot rnd=%d gap=%.8g eps_input=%.8g eps_compare=%.8g orderingGapLargeEnough=%d", roundingDigits, orderingGap, eps_input, eps_compare_init, orderingGapLargeEnough_init);
+   string notes = StringFormat("init_snapshot rnd=%d gap=%.8g eps=%.8g eps_compare=%.8g orderingGapLargeEnough=%d", roundingDigits, orderingGap, eps, eps_compare_init, orderingGapLargeEnough_init);
 
    string decCsv = StringFormat("\"%s\",\"DECISION_SUMMARY\",main_prev=%.8g@%s,main_now=%.8g@%s,signal_prev=%.8g,signal_now=%.8g,mainSignalSameSign=%d,histLargeEnough=%d,perBuy=%d,perSell=%d,atr=%.8g,rsi=%.8g,rnd=%d,gap=%.8g,notes=\"%s\"\r\n",
                                ts, main_prev, prev_ts, main_now, now_ts,
                                signal_prev, signal_now, mainSignalSameSign, histLargeEnough, perBuy, perSell, atr, rsi, roundingDigits, orderingGap, notes);
-   string decRaw = StringFormat("%s,DECISION_SUMMARY,mainSignalSameSign=%d,histLargeEnough=%d,perBuy=%d,perSell=%d,atr=%.8g,rsi=%.8g,rnd=%d,gap=%.8g,eps_input=%.8g,eps_compare=%.8g,orderingGapLargeEnough=%d\n",
-                               ts, mainSignalSameSign, histLargeEnough, perBuy, perSell, atr, rsi, roundingDigits, orderingGap, eps_input, eps_compare_init, orderingGapLargeEnough_init);
+   string decRaw = StringFormat("%s,DECISION_SUMMARY,mainSignalSameSign=%d,histLargeEnough=%d,perBuy=%d,perSell=%d,atr=%.8g,rsi=%.8g,rnd=%d,gap=%.8g,eps=%.8g,eps_compare=%.8g,orderingGapLargeEnough=%d\n",
+                               ts, mainSignalSameSign, histLargeEnough, perBuy, perSell, atr, rsi, roundingDigits, orderingGap, eps, eps_compare_init, orderingGapLargeEnough_init);
 
    if(PrintTradeInfo) Print("WaveCrestEA DIAG: WriteInitSnapshot: writing DECISION_SUMMARY");
    WriteToAllFiles(decCsv, decRaw);
@@ -616,10 +774,10 @@ void BatchProcessRange(datetime from_time, datetime to_time)
          double rsiBuf[]; int rc = CopyBuffer(rsiHandle, 0, closedOffset, 1, rsiBuf); if(rc>0) rsi = rsiBuf[0];
       }
 
-      double eps_input = HistOvershootThreshold;
+      // Use computed epsilon for rounding (market-adaptive)
       int roundingDigits = 1;
       if(RoundingDigitsOverride > 0) roundingDigits = RoundingDigitsOverride;
-      else if(eps_input > 0.0) roundingDigits = (int)MathMax(1.0, MathCeil(-MathLog10(eps_input)));
+      else if(eps > 0.0) roundingDigits = (int)MathMax(1.0, MathCeil(-MathLog10(eps)));
 
       double main_prev_r   = NormalizeDouble(main_prev, roundingDigits);
       double main_now_r    = NormalizeDouble(main_now, roundingDigits);
@@ -633,12 +791,10 @@ void BatchProcessRange(datetime from_time, datetime to_time)
       bool orderingSwappedBuy  = (MathAbs(main_prev_r) > MathAbs(signal_prev_r)) && (MathAbs(signal_now_r) > MathAbs(main_now_r));
       bool orderingSwappedSell = (MathAbs(signal_prev_r) > MathAbs(main_prev_r)) && (MathAbs(main_now_r) > MathAbs(signal_now_r));
 
-      // eps_compare: treat non-positive eps_input as "use MinOrderingGap"
-      double eps_compare;
-      if(eps_input <= 0.0) eps_compare = MinOrderingGap;
-      else eps_compare = MathMax(MathAbs(eps_input), MinOrderingGap);
+      // eps_compare: use market-adaptive threshold
+      double eps_compare = MathMax(eps, MinOrderingGap);
 
-      bool orderingGapLargeEnough = (ForcePassOrderingGap) ? true : (orderingGap > eps_compare);
+      bool orderingGapLargeEnough = (orderingGap > eps_compare);
 
       bool mainSignalSameSign = (main_now * signal_now) > 0.0;
       bool histLargeEnough = (MathAbs(hist_now_r) >= (MinHistAbsMult * safeEps));
@@ -697,7 +853,6 @@ void BatchProcessRange(datetime from_time, datetime to_time)
             tp = isBuy ? (entry + TP_Multiplier * slDistance) : (entry - TP_Multiplier * slDistance);
             double computedLots = CalcLotsForEntry(entry, sl);
             lots = computedLots;
-            if(lots <= 0.0 && ForceMinLots > 0.0) lots = ForceMinLots; // temporary testing fallback
             if(lots <= 0.0) { blockedByLots = 1; allowEntry = 0; isBuy = 0; isSell = 0; }
          }
       }
@@ -719,11 +874,11 @@ void BatchProcessRange(datetime from_time, datetime to_time)
       // Debug print: ordering/gap/lot decisions (batch)
       double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-      PrintFormat("DBG_ORDER %s eps_input=%.6g MinOrderingGap=%.6g eps_compare=%.6g orderingGap=%.6g orderingGapLargeEnough=%d orderingSwappedBuy=%d orderingSwappedSell=%d computedLots=%.5g lots=%.5g minLot=%.5g volStep=%.5g freeMargin=%.2f",
-                  now_ts, eps_input, MinOrderingGap, eps_compare, orderingGap, orderingGapLargeEnough?1:0, orderingSwappedBuy?1:0, orderingSwappedSell?1:0, CalcLotsForEntry(entry, sl), lots, minLot, volStep, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
+      PrintFormat("DBG_ORDER %s eps=%.6g MinOrderingGap=%.6g eps_compare=%.6g orderingGap=%.6g orderingGapLargeEnough=%d orderingSwappedBuy=%d orderingSwappedSell=%d computedLots=%.5g lots=%.5g minLot=%.5g volStep=%.5g freeMargin=%.2f",
+                  now_ts, eps, MinOrderingGap, eps_compare, orderingGap, orderingGapLargeEnough?1:0, orderingSwappedBuy?1:0, orderingSwappedSell?1:0, CalcLotsForEntry(entry, sl), lots, minLot, volStep, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
 
-      string decisionRaw = StringFormat("%s,DECISION_SUMMARY,allowEntry=%d,isBuy=%d,isSell=%d,blockedByRSI=%d,blockedByOvershoot=%d,blockedByNoSL=%d,slDistance=%.8g,computedLots=%.8g,lots=%.8g,entry=%.8g,sl=%.8g,tp=%.8g,rnd=%d,gap=%.8g,eps_input=%.8g,carryPrev=%d,predictorDisabled=%d\n",
-                                       now_ts, allowEntry, isBuy, isSell, blockedByRSI, blockedByOvershoot, blockedByNoSL, slDistance, CalcLotsForEntry(entry, sl), lots, entry, sl, tp, roundingDigits, orderingGap, eps_input, usedCarryPrev?1:0, DisablePredictor?1:0);
+      string decisionRaw = StringFormat("%s,DECISION_SUMMARY,allowEntry=%d,isBuy=%d,isSell=%d,blockedByRSI=%d,blockedByOvershoot=%d,blockedByNoSL=%d,slDistance=%.8g,computedLots=%.8g,lots=%.8g,entry=%.8g,sl=%.8g,tp=%.8g,rnd=%d,gap=%.8g,eps=%.8g,carryPrev=%d,predictorDisabled=%d\n",
+                                       now_ts, allowEntry, isBuy, isSell, blockedByRSI, blockedByOvershoot, blockedByNoSL, slDistance, CalcLotsForEntry(entry, sl), lots, entry, sl, tp, roundingDigits, orderingGap, eps, usedCarryPrev?1:0, DisablePredictor?1:0);
 
       WriteToAllFiles("", macdRaw);
       WriteToAllFiles("", decisionRaw);
@@ -764,9 +919,9 @@ int OnInit()
 
    EventSetTimer(1);
 
-   PrintFormat("WaveCrestEA DIAG: Initialized. MACD(%d,%d,%d) UseTestDateRange=%d From=%s To=%s UseCarryPrev=%d DisablePredictor=%d MinOrderingGap=%.8g ForcePassOrderingGap=%d ForceMinLots=%.8g RndOverride=%d",
+   PrintFormat("WaveCrestEA DIAG: Initialized. MACD(%d,%d,%d) UseTestDateRange=%d From=%s To=%s UseCarryPrev=%d DisablePredictor=%d MinOrderingGap=%.8g GapPct=%.4g TrailingStop=%d MinImprove=%.2g TrailDist=%.2g RndOverride=%d",
                MACD_Fast, MACD_Slow, MACD_Signal, UseTestDateRange?1:0, TimeToString(TestFromDate, TIME_DATE|TIME_SECONDS), TimeToString(TestToDate, TIME_DATE|TIME_SECONDS),
-               UseCarryPrev?1:0, DisablePredictor?1:0, MinOrderingGap, ForcePassOrderingGap?1:0, ForceMinLots, RoundingDigitsOverride);
+               UseCarryPrev?1:0, DisablePredictor?1:0, MinOrderingGap, GapPct, EnableTrailingStop?1:0, MinImprovementMult, TrailingStopATRMult, RoundingDigitsOverride);
    return(INIT_SUCCEEDED);
 }
 
@@ -936,10 +1091,10 @@ void OnTick()
       double rsiBuf[]; int rc = CopyBuffer(rsiHandle, 0, closedOffset, 1, rsiBuf); if(rc>0) rsi = rsiBuf[0];
    }
 
-   double eps_input = HistOvershootThreshold;
+   // Use computed epsilon for rounding (market-adaptive)
    int roundingDigits = 1;
    if(RoundingDigitsOverride > 0) roundingDigits = RoundingDigitsOverride;
-   else if(eps_input > 0.0) roundingDigits = (int)MathMax(1.0, MathCeil(-MathLog10(eps_input)));
+   else if(eps > 0.0) roundingDigits = (int)MathMax(1.0, MathCeil(-MathLog10(eps)));
 
    double main_prev_r   = NormalizeDouble(main_prev, roundingDigits);
    double main_now_r    = NormalizeDouble(main_now, roundingDigits);
@@ -952,12 +1107,10 @@ void OnTick()
    bool orderingSwappedBuy  = (MathAbs(main_prev_r) > MathAbs(signal_prev_r)) && (MathAbs(signal_now_r) > MathAbs(main_now_r));
    bool orderingSwappedSell = (MathAbs(signal_prev_r) > MathAbs(main_prev_r)) && (MathAbs(main_now_r) > MathAbs(signal_now_r));
 
-   // eps_compare: treat non-positive eps_input as "use MinOrderingGap"
-   double eps_compare;
-   if(eps_input <= 0.0) eps_compare = MinOrderingGap;
-   else eps_compare = MathMax(MathAbs(eps_input), MinOrderingGap);
+   // eps_compare: use market-adaptive threshold
+   double eps_compare = MathMax(eps, MinOrderingGap);
 
-   bool orderingGapLargeEnough = (ForcePassOrderingGap) ? true : (orderingGap > eps_compare);
+   bool orderingGapLargeEnough = (orderingGap > eps_compare);
 
    bool mainSignalSameSign = (main_now * signal_now) > 0.0;
    bool histLargeEnough = (MathAbs(hist_now_r) >= (MinHistAbsMult * safeEps));
@@ -1013,7 +1166,6 @@ void OnTick()
          tp = isBuy ? (entry + TP_Multiplier * slDistance) : (entry - TP_Multiplier * slDistance);
          double computedLots = CalcLotsForEntry(entry, sl);
          lots = computedLots;
-         if(lots <= 0.0 && ForceMinLots > 0.0) lots = ForceMinLots; // temporary testing fallback
          if(lots <= 0.0) { blockedByLots = 1; allowEntry = 0; isBuy = 0; isSell = 0; }
       }
    }
@@ -1045,8 +1197,8 @@ void OnTick()
 
    WriteToAllFiles(macdCsv, macdRaw);
 
-   string decisionNotes = StringFormat("decision_snapshot rnd=%d gap=%.8g eps_input=%.8g eps_compare=%.8g orderingSwappedBuy=%d orderingSwappedSell=%d orderingGapLargeEnough=%d carryPrevUsed=%d predictorDisabled=%d",
-                                       roundingDigits, orderingGap, eps_input, eps_compare, orderingSwappedBuy?1:0, orderingSwappedSell?1:0, orderingGapLargeEnough?1:0, usedCarryPrev?1:0, DisablePredictor?1:0);
+   string decisionNotes = StringFormat("decision_snapshot rnd=%d gap=%.8g eps=%.8g eps_compare=%.8g orderingSwappedBuy=%d orderingSwappedSell=%d orderingGapLargeEnough=%d carryPrevUsed=%d predictorDisabled=%d",
+                                       roundingDigits, orderingGap, eps, eps_compare, orderingSwappedBuy?1:0, orderingSwappedSell?1:0, orderingGapLargeEnough?1:0, usedCarryPrev?1:0, DisablePredictor?1:0);
 
    string decisionCsv = StringFormat("\"%s\",\"DECISION_SUMMARY\",signal_prev=%.8g@%s,signal_now=%.8g@%s,hist_prev=%.8g@%s,hist_now=%.8g@%s,main_prev=%.8g,main_now=%.8g,predicted_hist=%.8g,residual=%.8g,allowEntry=%d,isBuy=%d,isSell=%d,blockedByRSI=%d,blockedByOvershoot=%d,blockedByNoSL=%d,slDistance=%.8g,lots=%.8g,entry=%.8g,sl=%.8g,tp=%.8g,consecLosses=%d,notes=\"%s\"\r\n",
                                     tsBar,
@@ -1060,8 +1212,8 @@ void OnTick()
                                     slDistance, lots, entry, sl, tp, consecutiveLosses,
                                     decisionNotes);
 
-   string decisionRaw = StringFormat("%s,DECISION_SUMMARY,allowEntry=%d,isBuy=%d,isSell=%d,blockedByRSI=%d,blockedByOvershoot=%d,blockedByNoSL=%d,slDistance=%.8g,computedLots=%.8g,lots=%.8g,entry=%.8g,sl=%.8g,tp=%.8g,rnd=%d,gap=%.8g,eps_input=%.8g,carryPrev=%d,predictorDisabled=%d\n",
-                                    tsBar, allowEntry, isBuy, isSell, blockedByRSI, blockedByOvershoot, blockedByNoSL, slDistance, CalcLotsForEntry(entry, sl), lots, entry, sl, tp, roundingDigits, orderingGap, eps_input, usedCarryPrev?1:0, DisablePredictor?1:0);
+   string decisionRaw = StringFormat("%s,DECISION_SUMMARY,allowEntry=%d,isBuy=%d,isSell=%d,blockedByRSI=%d,blockedByOvershoot=%d,blockedByNoSL=%d,slDistance=%.8g,computedLots=%.8g,lots=%.8g,entry=%.8g,sl=%.8g,tp=%.8g,rnd=%d,gap=%.8g,eps=%.8g,carryPrev=%d,predictorDisabled=%d\n",
+                                    tsBar, allowEntry, isBuy, isSell, blockedByRSI, blockedByOvershoot, blockedByNoSL, slDistance, CalcLotsForEntry(entry, sl), lots, entry, sl, tp, roundingDigits, orderingGap, eps, usedCarryPrev?1:0, DisablePredictor?1:0);
 
    WriteToAllFiles(decisionCsv, decisionRaw);
 
@@ -1069,6 +1221,12 @@ void OnTick()
    lastLoggedNow_main = main_now;
    lastLoggedNow_signal = signal_now;
    lastLoggedNow_hist = hist_now;
+
+   // Update trailing stop on closed bar (uses previous bar data)
+   if(copiedRates >= 2)
+   {
+      UpdateTrailingStop(rates[1], atr);
+   }
 
    if(allowEntry)
    {
