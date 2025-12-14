@@ -572,7 +572,7 @@ void UpdateTrailingStopForPosition(ulong ticket)
    
    // Get current close price (of the last closed bar)
    MqlRates rates[];
-   if(CopyRates(_Symbol, PERIOD_CURRENT, 1, 2, rates) < 2) return;
+   if(CopyRates(_Symbol, PERIOD_CURRENT, 1, 1, rates) < 1) return;
    double currentClose = rates[0].close;
    
    // Get current ATR
@@ -695,15 +695,12 @@ void ManageTrailingStops()
             if(index < 0)
             {
                AddTrailingStop(ticket);
-               // After adding, get the new index
-               index = FindTrailingStopIndex(ticket);
+               // After adding, the new index is always at the end
+               index = trailingStopsCount - 1;
             }
             
             // Update trailing stop for this position
-            if(index >= 0)
-            {
-               UpdateTrailingStopForPosition(ticket);
-            }
+            UpdateTrailingStopForPosition(ticket);
          }
       }
    }
