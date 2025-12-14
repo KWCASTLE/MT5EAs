@@ -637,7 +637,8 @@ void UpdateTrailingStopForPosition(ulong ticket)
       newSL = currentClose + trailDistance;
       
       // Only move SL down, never up (for sell, down means better SL)
-      if(newSL < posSL || posSL == 0.0)
+      // If no SL is set (posSL == 0.0), set the initial trailing SL
+      if(posSL == 0.0 || newSL < posSL)
       {
          shouldUpdate = true;
       }
@@ -679,7 +680,7 @@ void ManageTrailingStops()
       }
    }
    
-   // Then, ensure all open positions are tracked
+   // Then, ensure all open positions for this symbol are tracked and update them
    int totalPos = PositionsTotal();
    for(int i=0; i<totalPos; i++)
    {
@@ -694,15 +695,17 @@ void ManageTrailingStops()
             if(index < 0)
             {
                AddTrailingStop(ticket);
+               // After adding, get the new index
+               index = FindTrailingStopIndex(ticket);
+            }
+            
+            // Update trailing stop for this position
+            if(index >= 0)
+            {
+               UpdateTrailingStopForPosition(ticket);
             }
          }
       }
-   }
-   
-   // Finally, update trailing stops for all tracked positions
-   for(int i=0; i<trailingStopsCount; i++)
-   {
-      UpdateTrailingStopForPosition(trailingStops[i].ticket);
    }
 }
 
