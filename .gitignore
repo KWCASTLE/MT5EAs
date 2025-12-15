@@ -1,0 +1,11 @@
+# Debug files
+wavecrest_debug_struct.csv
+wavecrest_debug_raw.txt
+wavecrestdebug.txt
+
+# MQL5 compiled files
+*.ex5
+
+# Temporary files
+*.tmp
+*.log

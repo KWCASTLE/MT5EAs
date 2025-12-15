@@ -62,7 +62,7 @@ void BatchProcessRange(datetime from_time, datetime to_time);
 void WriteInitSnapshot();
 
 double PointSize();
-double ComputeEpsilon(double atr);
+double ComputeEpsilon(double atr, double signalValue);
 double NormalizeLots(double lots);
 
 double CalcLotsByRisk(double entryPrice, double stopPrice, double riskPercent);
@@ -77,6 +77,11 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 
 bool WaitForMacdMainAndSignal(int closedOffset, int needCount, int maxAttempts, int sleepMs);
 string TimeStampOrNA(datetime t);
+
+void AddTrailingStop(ulong ticket, double entryPrice, double currentSL, bool isBuy);
+void RemoveTrailingStop(ulong ticket);
+void UpdateTrailingStops(double atr);
+int FindTrailingStopIndex(ulong ticket);
 // --------------------------------------------------------------------
 
 // --------------------------- INPUTS --------------------------------
@@ -87,32 +92,35 @@ input int    ATR_Period  = 14;
 input double ATR_Multiplier = 1.5;
 input double TP_Multiplier  = 2.0;
 input double RiskPercentPerTrade = 0.5;
-input double FixedLotForTesting  = 0.0;
 input double MinLot = 0.01;
 input int    MaxDoublings = 5;
 input double LossMultiplier = 2.0;
 input int    RSI_Period = 14;
 input double RSI_Buy_Threshold = 45.0;
 input double RSI_Sell_Threshold = 55.0;
-input double HistOvershootThreshold = 0.00001;
+input double GapPct = 0.5;  // Percentage of signal value for gap threshold
 input int    MinBarsBetweenSignals = 3;
 input int    Emergence_RequiredBars = 2;
 input double Emergence_kResidual = 1.0;
 input double MinHistAbsMult = 1.0;
+input bool   EnableTrailingStop = true;
+input double MinimumImprovementATRMultiple = 0.5;
 input bool   PrintTradeInfo = true;
 input int    MaxRetriesOnSend = 1;
 
-input bool   UseCarryPrev = true;
-input bool   DisablePredictor = false;
-input double MinOrderingGap = 0.00005;
-input bool   ForcePassOrderingGap = false;   // TEMP: bypass ordering gap for testing
-input double ForceMinLots = 0.0;            // TEMP: if >0 and computed lots round to 0, use this for testing
-input int    RoundingDigitsOverride = 0;
-input bool   ForceIndicatorAppliedPriceClose = true;
+// Hidden/hardcoded inputs for internal use
+bool   UseCarryPrev = true;
+bool   DisablePredictor = false;
+double MinOrderingGap = 0.00005;
+bool   ForcePassOrderingGap = false;
+double ForceMinLots = 0.0;
+int    RoundingDigitsOverride = 0;
+bool   ForceIndicatorAppliedPriceClose = true;
+double FixedLotForTesting = 0.0;
 
-input bool   UseTestDateRange = false;
-input datetime TestFromDate = D'2025.08.01 00:00';
-input datetime TestToDate   = D'2025.11.10 23:59';
+bool   UseTestDateRange = false;
+datetime TestFromDate = D'2025.08.01 00:00';
+datetime TestToDate   = D'2025.11.10 23:59';
 
 // --------------------------- DEBUG FILE NAMES -----------------------
 string DEBUG_FILENAME  = "wavecrest_debug_struct.csv";
@@ -142,13 +150,27 @@ double lastLoggedNow_main = 0.0;
 double lastLoggedNow_signal = 0.0;
 double lastLoggedNow_hist = 0.0;
 
+// Trailing stop tracking
+struct TrailingStopInfo
+{
+   ulong ticket;
+   double entryPrice;
+   double currentSL;
+   double bestPrice;
+   bool isActive;
+   bool isBuy;
+};
+TrailingStopInfo trailingStops[100]; // Support up to 100 positions
+int trailingStopCount = 0;
+
 // --------------------------- HELPERS --------------------------------
 double PointSize() { return(SymbolInfoDouble(_Symbol, SYMBOL_POINT)); }
 
-double ComputeEpsilon(double atr)
+double ComputeEpsilon(double atr, double signalValue)
 {
-   if(atr > 0.0) return MathMax(HistOvershootThreshold, 0.01 * atr);
-   return MathMax(HistOvershootThreshold, PointSize()*1.0);
+   double gapThreshold = MathAbs(signalValue) * (GapPct / 100.0);
+   if(atr > 0.0) return MathMax(gapThreshold, 0.01 * atr);
+   return MathMax(gapThreshold, PointSize()*1.0);
 }
 
 double NormalizeLots(double lots)
@@ -400,10 +422,10 @@ void WriteInitSnapshot()
    {
       double atrB[]; int c = CopyBuffer(atrHandle, 0, closedOffset, 1, atrB); if(c>0) atr = atrB[0];
    }
-   double eps = ComputeEpsilon(atr);
+   double eps = ComputeEpsilon(atr, signal_now);
    double safeEps = MathMax(eps, PointSize()*1e-12);
 
-   double eps_input = HistOvershootThreshold;
+   double eps_input = GapPct;
    int roundingDigits = 1;
    if(RoundingDigitsOverride > 0) roundingDigits = RoundingDigitsOverride;
    else if(eps_input > 0.0) roundingDigits = (int)MathMax(1.0, MathCeil(-MathLog10(eps_input)));
@@ -606,7 +628,7 @@ void BatchProcessRange(datetime from_time, datetime to_time)
       {
          double atrBuf[]; int ac = CopyBuffer(atrHandle, 0, closedOffset, 1, atrBuf); if(ac>0) atr = atrBuf[0];
       }
-      double eps = ComputeEpsilon(atr);
+      double eps = ComputeEpsilon(atr, signal_now);
       double safeEps = MathMax(eps, PointSize()*1e-12);
       double normResidual = (safeEps>0.0) ? (residual / safeEps) : 0.0;
 
@@ -616,7 +638,7 @@ void BatchProcessRange(datetime from_time, datetime to_time)
          double rsiBuf[]; int rc = CopyBuffer(rsiHandle, 0, closedOffset, 1, rsiBuf); if(rc>0) rsi = rsiBuf[0];
       }
 
-      double eps_input = HistOvershootThreshold;
+      double eps_input = GapPct;
       int roundingDigits = 1;
       if(RoundingDigitsOverride > 0) roundingDigits = RoundingDigitsOverride;
       else if(eps_input > 0.0) roundingDigits = (int)MathMax(1.0, MathCeil(-MathLog10(eps_input)));
@@ -735,6 +757,130 @@ void BatchProcessRange(datetime from_time, datetime to_time)
    PrintFormat("WaveCrestEA DIAG: BatchProcessRange finished for %s - %s processed=%d skipped=%d", TimeToString(from_time, TIME_DATE|TIME_SECONDS), TimeToString(to_time, TIME_DATE|TIME_SECONDS), processed, skipped);
 }
 
+// --------------------------- TRAILING STOP HELPERS ------------------
+void AddTrailingStop(ulong ticket, double entryPrice, double currentSL, bool isBuy)
+{
+   if(!EnableTrailingStop) return;
+   
+   for(int i = 0; i < trailingStopCount; i++)
+   {
+      if(trailingStops[i].ticket == ticket) return; // Already exists
+   }
+   
+   if(trailingStopCount < 100)
+   {
+      trailingStops[trailingStopCount].ticket = ticket;
+      trailingStops[trailingStopCount].entryPrice = entryPrice;
+      trailingStops[trailingStopCount].currentSL = currentSL;
+      trailingStops[trailingStopCount].bestPrice = entryPrice;
+      trailingStops[trailingStopCount].isActive = false;
+      trailingStops[trailingStopCount].isBuy = isBuy;
+      trailingStopCount++;
+      PrintFormat("WaveCrestEA: Added trailing stop for ticket #%I64u", ticket);
+   }
+}
+
+void RemoveTrailingStop(ulong ticket)
+{
+   for(int i = 0; i < trailingStopCount; i++)
+   {
+      if(trailingStops[i].ticket == ticket)
+      {
+         // Shift remaining elements
+         for(int j = i; j < trailingStopCount - 1; j++)
+         {
+            trailingStops[j] = trailingStops[j + 1];
+         }
+         trailingStopCount--;
+         PrintFormat("WaveCrestEA: Removed trailing stop for ticket #%I64u", ticket);
+         return;
+      }
+   }
+}
+
+int FindTrailingStopIndex(ulong ticket)
+{
+   for(int i = 0; i < trailingStopCount; i++)
+   {
+      if(trailingStops[i].ticket == ticket) return i;
+   }
+   return -1;
+}
+
+void UpdateTrailingStops(double atr)
+{
+   if(!EnableTrailingStop || atr <= 0.0) return;
+   
+   double minImprovement = atr * MinimumImprovementATRMultiple;
+   
+   for(int i = trailingStopCount - 1; i >= 0; i--)
+   {
+      ulong ticket = trailingStops[i].ticket;
+      
+      // Check if position still exists
+      if(!PositionSelectByTicket(ticket))
+      {
+         RemoveTrailingStop(ticket);
+         continue;
+      }
+      
+      double currentPrice = trailingStops[i].isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double entryPrice = trailingStops[i].entryPrice;
+      double bestPrice = trailingStops[i].bestPrice;
+      bool isBuy = trailingStops[i].isBuy;
+      
+      // Update best price
+      if(isBuy && currentPrice > bestPrice)
+      {
+         trailingStops[i].bestPrice = currentPrice;
+         bestPrice = currentPrice;
+      }
+      else if(!isBuy && currentPrice < bestPrice)
+      {
+         trailingStops[i].bestPrice = currentPrice;
+         bestPrice = currentPrice;
+      }
+      
+      // Check if trailing stop should be activated
+      double improvement = isBuy ? (bestPrice - entryPrice) : (entryPrice - bestPrice);
+      
+      if(!trailingStops[i].isActive && improvement >= minImprovement)
+      {
+         trailingStops[i].isActive = true;
+         PrintFormat("WaveCrestEA: Trailing stop ACTIVATED for ticket #%I64u, improvement=%.5f >= minImprovement=%.5f", 
+                     ticket, improvement, minImprovement);
+      }
+      
+      // Apply trailing stop if active
+      if(trailingStops[i].isActive)
+      {
+         double currentSL = PositionGetDouble(POSITION_SL);
+         double newSL;
+         
+         if(isBuy)
+         {
+            newSL = bestPrice - atr * ATR_Multiplier;
+            if(newSL > currentSL + PointSize() * 10) // Only move SL up for buy
+            {
+               trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+               trailingStops[i].currentSL = newSL;
+               PrintFormat("WaveCrestEA: Trailing stop updated for BUY ticket #%I64u, new SL=%.5f", ticket, newSL);
+            }
+         }
+         else
+         {
+            newSL = bestPrice + atr * ATR_Multiplier;
+            if(newSL < currentSL - PointSize() * 10) // Only move SL down for sell
+            {
+               trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+               trailingStops[i].currentSL = newSL;
+               PrintFormat("WaveCrestEA: Trailing stop updated for SELL ticket #%I64u, new SL=%.5f", ticket, newSL);
+            }
+         }
+      }
+   }
+}
+
 // --------------------------- LIFECYCLE -------------------------------
 int OnInit()
 {
@@ -792,25 +938,48 @@ void OnDeinit(const int reason)
    PrintFormat("WaveCrestEA DIAG: Deinit reason=%d", reason);
 }
 
-// Handle deals to track consecutive losses
+// Handle deals to track consecutive losses and manage trailing stops
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
-   if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
-   ulong dealTicket = trans.deal;
-   if(dealTicket == 0) return;
-   string dsym = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
-   if(dsym != _Symbol) return;
-   double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-   if(profit < 0.0)
+   // Handle new positions for trailing stop
+   if(trans.type == TRADE_TRANSACTION_ORDER_ADD && result.retcode == TRADE_RETCODE_DONE && result.deal > 0)
    {
-      consecutiveLosses++;
-      if(consecutiveLosses > MaxDoublings) consecutiveLosses = MaxDoublings;
-      PrintFormat("WaveCrestEA DIAG: Loss deal profit=%.8g consecutiveLosses=%d", profit, consecutiveLosses);
+      if(PositionSelectByTicket(result.order))
+      {
+         double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double currentSL = PositionGetDouble(POSITION_SL);
+         bool isBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+         AddTrailingStop(result.order, entryPrice, currentSL, isBuy);
+      }
    }
-   else
+   
+   // Handle closed positions
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
-      if(consecutiveLosses != 0) PrintFormat("WaveCrestEA DIAG: Win/BE deal profit=%.8g resetting consecutiveLosses %d->0", profit, consecutiveLosses);
-      consecutiveLosses = 0;
+      ulong dealTicket = trans.deal;
+      if(dealTicket == 0) return;
+      string dsym = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+      if(dsym != _Symbol) return;
+      
+      // Remove trailing stop tracking for closed position
+      ulong positionId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      if(positionId > 0)
+      {
+         RemoveTrailingStop(positionId);
+      }
+      
+      double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+      if(profit < 0.0)
+      {
+         consecutiveLosses++;
+         if(consecutiveLosses > MaxDoublings) consecutiveLosses = MaxDoublings;
+         PrintFormat("WaveCrestEA DIAG: Loss deal profit=%.8g consecutiveLosses=%d", profit, consecutiveLosses);
+      }
+      else
+      {
+         if(consecutiveLosses != 0) PrintFormat("WaveCrestEA DIAG: Win/BE deal profit=%.8g resetting consecutiveLosses %d->0", profit, consecutiveLosses);
+         consecutiveLosses = 0;
+      }
    }
 }
 
@@ -926,7 +1095,11 @@ void OnTick()
    {
       double atrBuf[]; int ac = CopyBuffer(atrHandle, 0, closedOffset, 1, atrBuf); if(ac>0) atr = atrBuf[0];
    }
-   double eps = ComputeEpsilon(atr);
+   
+   // Update trailing stops on every tick
+   UpdateTrailingStops(atr);
+   
+   double eps = ComputeEpsilon(atr, signal_now);
    double safeEps = MathMax(eps, PointSize()*1e-12);
    double normResidual = (safeEps > 0.0) ? residual / safeEps : 0.0;
 
@@ -936,7 +1109,7 @@ void OnTick()
       double rsiBuf[]; int rc = CopyBuffer(rsiHandle, 0, closedOffset, 1, rsiBuf); if(rc>0) rsi = rsiBuf[0];
    }
 
-   double eps_input = HistOvershootThreshold;
+   double eps_input = GapPct;
    int roundingDigits = 1;
    if(RoundingDigitsOverride > 0) roundingDigits = RoundingDigitsOverride;
    else if(eps_input > 0.0) roundingDigits = (int)MathMax(1.0, MathCeil(-MathLog10(eps_input)));
@@ -1077,6 +1250,14 @@ void OnTick()
       if(sent)
       {
          PrintFormat("WaveCrestEA: ORDER_PLACED %s lots=%.2f", (isBuy? "BUY":"SELL"), lots);
+         
+         // Add trailing stop tracking for the new position
+         ulong ticket = trade.ResultOrder();
+         if(ticket > 0)
+         {
+            AddTrailingStop(ticket, entry, sl, isBuy==1);
+         }
+         
          barsSinceLastEntry = 0;
          look_for = 0;
       }
