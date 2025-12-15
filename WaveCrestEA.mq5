@@ -252,10 +252,15 @@ bool PlaceOrder(bool isBuy, double lots, double sl, double tp, string comment)
       if(ok)
       {
          // Add position to trailing stop tracking if enabled
-         if(Enable_Trailing_Stop && trade.ResultOrder() > 0)
+         if(Enable_Trailing_Stop)
          {
-            double entryPrice = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            AddTrailingStop(trade.ResultOrder(), entryPrice);
+            // Get the position ticket by selecting the position for this symbol
+            if(PositionSelect(_Symbol))
+            {
+               ulong posTicket = PositionGetInteger(POSITION_TICKET);
+               double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+               AddTrailingStop(posTicket, entryPrice);
+            }
          }
          return true;
       }
