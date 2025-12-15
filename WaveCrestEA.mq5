@@ -1,14 +1,16 @@
 //+------------------------------------------------------------------+
-//| WaveCrestEA v1.87 - ensure magnitude-based ordering comparisons  |
+//| WaveCrestEA v1.90 - ATR-based trailing stop & input reorganization |
+//| - Added ATR-based trailing stop mechanism (EnableTrailingStop, MinimumImprovementATRMultiple)
+//| - Renamed HistOvershootThreshold to GapPct with percentage-based calculation
+//| - Hidden obsolete testing inputs (ForcePassOrderingGap, ForceMinLots, etc.)
 //| - Use MathAbs(...) for ordering / overshoot comparisons (magnitude)
 //| - Use only sign of main & hist to decide buy vs sell (positive=>sell, negative=>buy)
 //| - Make init snapshot symmetric for buy and sell emergences
 //| - Keep predictor / residual / hist magnitude / RSI gating intact
 //| - Treat non-positive internal eps_input as "use MinOrderingGap"
-//| - Add temporary testing toggles: ForcePassOrderingGap, ForceMinLots
 //+------------------------------------------------------------------+
 #property copyright "WaveCrestEA"
-#property version   "1.87"
+#property version   "1.90"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -941,44 +943,54 @@ void OnDeinit(const int reason)
 // Handle deals to track consecutive losses and manage trailing stops
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
-   // Handle new positions for trailing stop
-   if(trans.type == TRADE_TRANSACTION_ORDER_ADD && result.retcode == TRADE_RETCODE_DONE && result.deal > 0)
-   {
-      if(PositionSelectByTicket(result.order))
-      {
-         double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-         double currentSL = PositionGetDouble(POSITION_SL);
-         bool isBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-         AddTrailingStop(result.order, entryPrice, currentSL, isBuy);
-      }
-   }
-   
-   // Handle closed positions
+   // Handle deals (both opening and closing)
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
       ulong dealTicket = trans.deal;
       if(dealTicket == 0) return;
+      
+      if(!HistoryDealSelect(dealTicket)) return;
+      
       string dsym = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
       if(dsym != _Symbol) return;
       
-      // Remove trailing stop tracking for closed position
+      long dealEntry = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
       ulong positionId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-      if(positionId > 0)
+      
+      // Deal is opening a new position
+      if(dealEntry == DEAL_ENTRY_IN && positionId > 0)
       {
+         // Position was just opened - add trailing stop tracking
+         if(PositionSelectByTicket(positionId))
+         {
+            double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double currentSL = PositionGetDouble(POSITION_SL);
+            bool isBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+            AddTrailingStop(positionId, entryPrice, currentSL, isBuy);
+         }
+      }
+      // Deal is closing a position
+      else if((dealEntry == DEAL_ENTRY_OUT || dealEntry == DEAL_ENTRY_OUT_BY) && positionId > 0)
+      {
+         // Remove trailing stop tracking for closed position
          RemoveTrailingStop(positionId);
       }
       
+      // Track consecutive losses
       double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-      if(profit < 0.0)
+      if(dealEntry == DEAL_ENTRY_OUT || dealEntry == DEAL_ENTRY_OUT_BY)
       {
-         consecutiveLosses++;
-         if(consecutiveLosses > MaxDoublings) consecutiveLosses = MaxDoublings;
-         PrintFormat("WaveCrestEA DIAG: Loss deal profit=%.8g consecutiveLosses=%d", profit, consecutiveLosses);
-      }
-      else
-      {
-         if(consecutiveLosses != 0) PrintFormat("WaveCrestEA DIAG: Win/BE deal profit=%.8g resetting consecutiveLosses %d->0", profit, consecutiveLosses);
-         consecutiveLosses = 0;
+         if(profit < 0.0)
+         {
+            consecutiveLosses++;
+            if(consecutiveLosses > MaxDoublings) consecutiveLosses = MaxDoublings;
+            PrintFormat("WaveCrestEA DIAG: Loss deal profit=%.8g consecutiveLosses=%d", profit, consecutiveLosses);
+         }
+         else
+         {
+            if(consecutiveLosses != 0) PrintFormat("WaveCrestEA DIAG: Win/BE deal profit=%.8g resetting consecutiveLosses %d->0", profit, consecutiveLosses);
+            consecutiveLosses = 0;
+         }
       }
    }
 }
@@ -1250,14 +1262,7 @@ void OnTick()
       if(sent)
       {
          PrintFormat("WaveCrestEA: ORDER_PLACED %s lots=%.2f", (isBuy? "BUY":"SELL"), lots);
-         
-         // Add trailing stop tracking for the new position
-         ulong ticket = trade.ResultOrder();
-         if(ticket > 0)
-         {
-            AddTrailingStop(ticket, entry, sl, isBuy==1);
-         }
-         
+         // Trailing stop tracking is handled automatically in OnTradeTransaction
          barsSinceLastEntry = 0;
          look_for = 0;
       }
