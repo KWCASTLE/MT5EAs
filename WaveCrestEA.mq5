@@ -153,6 +153,9 @@ double lastLoggedNow_signal = 0.0;
 double lastLoggedNow_hist = 0.0;
 
 // Trailing stop tracking
+#define MAX_TRAILING_POSITIONS 100
+#define MIN_SL_MOVE_POINTS 10
+
 struct TrailingStopInfo
 {
    ulong ticket;
@@ -162,7 +165,7 @@ struct TrailingStopInfo
    bool isActive;
    bool isBuy;
 };
-TrailingStopInfo trailingStops[100]; // Support up to 100 positions
+TrailingStopInfo trailingStops[MAX_TRAILING_POSITIONS];
 int trailingStopCount = 0;
 
 // --------------------------- HELPERS --------------------------------
@@ -171,8 +174,13 @@ double PointSize() { return(SymbolInfoDouble(_Symbol, SYMBOL_POINT)); }
 double ComputeEpsilon(double atr, double signalValue)
 {
    double gapThreshold = MathAbs(signalValue) * (GapPct / 100.0);
+   double minThreshold = PointSize() * 1.0;
+   
+   // Ensure we have a minimum threshold even when signal is near zero
+   if(gapThreshold < minThreshold) gapThreshold = minThreshold;
+   
    if(atr > 0.0) return MathMax(gapThreshold, 0.01 * atr);
-   return MathMax(gapThreshold, PointSize()*1.0);
+   return gapThreshold;
 }
 
 double NormalizeLots(double lots)
@@ -769,7 +777,7 @@ void AddTrailingStop(ulong ticket, double entryPrice, double currentSL, bool isB
       if(trailingStops[i].ticket == ticket) return; // Already exists
    }
    
-   if(trailingStopCount < 100)
+   if(trailingStopCount < MAX_TRAILING_POSITIONS)
    {
       trailingStops[trailingStopCount].ticket = ticket;
       trailingStops[trailingStopCount].entryPrice = entryPrice;
@@ -779,6 +787,10 @@ void AddTrailingStop(ulong ticket, double entryPrice, double currentSL, bool isB
       trailingStops[trailingStopCount].isBuy = isBuy;
       trailingStopCount++;
       PrintFormat("WaveCrestEA: Added trailing stop for ticket #%I64u", ticket);
+   }
+   else
+   {
+      PrintFormat("WaveCrestEA WARNING: Cannot add trailing stop for ticket #%I64u - maximum positions (%d) reached", ticket, MAX_TRAILING_POSITIONS);
    }
 }
 
@@ -862,7 +874,7 @@ void UpdateTrailingStops(double atr)
          if(isBuy)
          {
             newSL = bestPrice - atr * ATR_Multiplier;
-            if(newSL > currentSL + PointSize() * 10) // Only move SL up for buy
+            if(newSL > currentSL + PointSize() * MIN_SL_MOVE_POINTS) // Only move SL up for buy
             {
                trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
                trailingStops[i].currentSL = newSL;
@@ -872,7 +884,7 @@ void UpdateTrailingStops(double atr)
          else
          {
             newSL = bestPrice + atr * ATR_Multiplier;
-            if(newSL < currentSL - PointSize() * 10) // Only move SL down for sell
+            if(newSL < currentSL - PointSize() * MIN_SL_MOVE_POINTS) // Only move SL down for sell
             {
                trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
                trailingStops[i].currentSL = newSL;
