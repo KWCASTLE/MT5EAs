@@ -254,12 +254,20 @@ bool PlaceOrder(bool isBuy, double lots, double sl, double tp, string comment)
          // Add position to trailing stop tracking if enabled
          if(Enable_Trailing_Stop)
          {
-            // Get the position ticket by selecting the position for this symbol
-            if(PositionSelect(_Symbol))
+            // Get the order ticket from the trade result
+            ulong orderTicket = trade.ResultOrder();
+            if(orderTicket > 0)
             {
-               ulong posTicket = PositionGetInteger(POSITION_TICKET);
-               double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-               AddTrailingStop(posTicket, entryPrice);
+               // Select the order from history to get position ticket
+               if(HistoryOrderSelect(orderTicket))
+               {
+                  ulong posTicket = HistoryOrderGetInteger(orderTicket, ORDER_POSITION_ID);
+                  if(posTicket > 0 && PositionSelectByTicket(posTicket))
+                  {
+                     double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+                     AddTrailingStop(posTicket, entryPrice);
+                  }
+               }
             }
          }
          return true;
@@ -363,7 +371,7 @@ void ManageTrailingStops()
          {
             newSL = posCurrentPrice - trailDistance;
             // Only move SL up, never down
-            if(newSL > posSL && newSL < posCurrentPrice)
+            if(newSL > posSL && newSL <= posCurrentPrice)
             {
                if(trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
                {
@@ -377,7 +385,7 @@ void ManageTrailingStops()
          {
             newSL = posCurrentPrice + trailDistance;
             // Only move SL down, never up
-            if((posSL == 0.0 || newSL < posSL) && newSL > posCurrentPrice)
+            if((posSL == 0.0 || newSL < posSL) && newSL >= posCurrentPrice)
             {
                if(trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
                {
