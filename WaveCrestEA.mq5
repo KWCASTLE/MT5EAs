@@ -46,6 +46,9 @@ CTrade trade;
 #ifndef SEEK_END
   #define SEEK_END    2
 #endif
+#ifndef MAX_BARS_TO_SEARCH
+  #define MAX_BARS_TO_SEARCH 5000
+#endif
 // --------------------------------------------------------------------
 
 // --------------------------- PROTOTYPES ------------------------------
@@ -509,7 +512,7 @@ int GetBarShift(string symbol, ENUM_TIMEFRAMES timeframe, datetime time)
    ArraySetAsSeries(time_arr, true);
    
    // Copy a reasonable number of bars to search through
-   int copied = CopyTime(symbol, timeframe, 0, 5000, time_arr);
+   int copied = CopyTime(symbol, timeframe, 0, MAX_BARS_TO_SEARCH, time_arr);
    if(copied <= 0) return -1;
    
    // Find the bar with time <= requested time (closest bar not newer than requested time)
@@ -548,7 +551,7 @@ void BatchProcessRange(datetime from_time, datetime to_time)
       PrintFormat("WaveCrestEA DIAG: BatchProcessRange: iBarShift failed shiftFrom=%d shiftTo=%d", shiftFrom, shiftTo);
       // fallback via CopyRates scan
       MqlRates tmpRates[];
-      int copied = CopyRates(_Symbol, PERIOD_CURRENT, 0, 5000, tmpRates);
+      int copied = CopyRates(_Symbol, PERIOD_CURRENT, 0, MAX_BARS_TO_SEARCH, tmpRates);
       if(copied <= 0) { Print("WaveCrestEA DIAG: BatchProcessRange fallback CopyRates failed"); return; }
       int foundFrom=-1, foundTo=-1;
       for(int i=0;i<copied;i++)
