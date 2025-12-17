@@ -77,6 +77,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 
 bool WaitForMacdMainAndSignal(int closedOffset, int needCount, int maxAttempts, int sleepMs);
 string TimeStampOrNA(datetime t);
+int GetBarShift(string symbol, ENUM_TIMEFRAMES timeframe, datetime time);
 // --------------------------------------------------------------------
 
 // --------------------------- INPUTS --------------------------------
@@ -298,14 +299,14 @@ bool WriteToAllFiles(string csvRow, string rawRow)
 
    if(StringLen(csvRow) > 0)
    {
-      if(fh_local_struct != INVALID_HANDLE) { w = (FileWriteString(fh_local_struct, csvRow) > 0); FileFlush(fh_local_struct); ok &= w; } else ok &= WriteStructuredRowOneShot(csvRow);
-      if(fh_common_struct!= INVALID_HANDLE) { w = (FileWriteString(fh_common_struct, csvRow) > 0); FileFlush(fh_common_struct); ok &= w; } else ok &= WriteStructuredRowOneShot(csvRow);
+      if(fh_local_struct != INVALID_HANDLE) { w = (FileWriteString(fh_local_struct, csvRow) > 0); FileFlush(fh_local_struct); ok = ok && w; } else ok = ok && WriteStructuredRowOneShot(csvRow);
+      if(fh_common_struct!= INVALID_HANDLE) { w = (FileWriteString(fh_common_struct, csvRow) > 0); FileFlush(fh_common_struct); ok = ok && w; } else ok = ok && WriteStructuredRowOneShot(csvRow);
    }
 
    if(StringLen(rawRow) > 0)
    {
-      if(fh_local_raw != INVALID_HANDLE) { w = (FileWriteString(fh_local_raw, rawRow) > 0); FileFlush(fh_local_raw); ok &= w; } else ok &= WriteRawRowOneShot(rawRow);
-      if(fh_common_raw!= INVALID_HANDLE) { w = (FileWriteString(fh_common_raw, rawRow) > 0); FileFlush(fh_common_raw); ok &= w; } else ok &= WriteRawRowOneShot(rawRow);
+      if(fh_local_raw != INVALID_HANDLE) { w = (FileWriteString(fh_local_raw, rawRow) > 0); FileFlush(fh_local_raw); ok = ok && w; } else ok = ok && WriteRawRowOneShot(rawRow);
+      if(fh_common_raw!= INVALID_HANDLE) { w = (FileWriteString(fh_common_raw, rawRow) > 0); FileFlush(fh_common_raw); ok = ok && w; } else ok = ok && WriteRawRowOneShot(rawRow);
    }
 
    if(!ok) PrintFormat("WaveCrestEA DIAG: WriteToAllFiles some writes failed GetLastError=%d", GetLastError());
@@ -495,6 +496,34 @@ void WriteInitSnapshot()
    WriteToAllFiles(decCsv, decRaw);
 }
 
+// --------------------------- BAR SHIFT HELPER -----------------------
+int GetBarShift(string symbol, ENUM_TIMEFRAMES timeframe, datetime time)
+{
+   // MQL5 doesn't have iBarShift, so we implement it using Bars
+   // Returns the shift (index) of the bar with the specified time
+   // Returns -1 if the bar is not found
+   
+   if(time < 0) return -1;
+   
+   datetime time_arr[];
+   ArraySetAsSeries(time_arr, true);
+   
+   // Copy a reasonable number of bars to search through
+   int copied = CopyTime(symbol, timeframe, 0, 5000, time_arr);
+   if(copied <= 0) return -1;
+   
+   // Find the bar with time <= requested time (closest bar not newer than requested time)
+   for(int i = 0; i < copied; i++)
+   {
+      if(time_arr[i] <= time)
+      {
+         return i;
+      }
+   }
+   
+   return -1; // Not found
+}
+
 // --------------------------- BATCH PROCESSING -----------------------
 void BatchProcessRange(datetime from_time, datetime to_time)
 {
@@ -511,8 +540,8 @@ void BatchProcessRange(datetime from_time, datetime to_time)
       to_time = tmp;
    }
 
-   int shiftFrom = iBarShift(_Symbol, PERIOD_CURRENT, from_time, false);
-   int shiftTo   = iBarShift(_Symbol, PERIOD_CURRENT, to_time,   false);
+   int shiftFrom = GetBarShift(_Symbol, PERIOD_CURRENT, from_time);
+   int shiftTo   = GetBarShift(_Symbol, PERIOD_CURRENT, to_time);
 
    if(shiftFrom < 0 || shiftTo < 0)
    {
