@@ -1,5 +1,9 @@
 //+------------------------------------------------------------------+
-//| WaveCrestEA v1.87 - ensure magnitude-based ordering comparisons  |
+//| WaveCrestEA v1.89 - Added Trailing Stop Functionality            |
+//| - Added trailing stop with min improvement threshold             |
+//| - UseTrailingStop input to enable/disable feature                |
+//| - TrailingStopMinImprovement: ATR multiplier for activation      |
+//| - Fixed MQL5 compilation errors (iBarShift, boolean operators)   |
 //| - Use MathAbs(...) for ordering / overshoot comparisons (magnitude)
 //| - Use only sign of main & hist to decide buy vs sell (positive=>sell, negative=>buy)
 //| - Make init snapshot symmetric for buy and sell emergences
@@ -8,7 +12,7 @@
 //| - Add temporary testing toggles: ForcePassOrderingGap, ForceMinLots
 //+------------------------------------------------------------------+
 #property copyright "WaveCrestEA"
-#property version   "1.87"
+#property version   "1.89"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -46,6 +50,9 @@ CTrade trade;
 #ifndef SEEK_END
   #define SEEK_END    2
 #endif
+#ifndef MAX_BARS_TO_SEARCH
+  #define MAX_BARS_TO_SEARCH 5000
+#endif
 // --------------------------------------------------------------------
 
 // --------------------------- PROTOTYPES ------------------------------
@@ -77,6 +84,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 
 bool WaitForMacdMainAndSignal(int closedOffset, int needCount, int maxAttempts, int sleepMs);
 string TimeStampOrNA(datetime t);
+int GetBarShift(string symbol, ENUM_TIMEFRAMES timeframe, datetime time);
+void ManageTrailingStop();
 // --------------------------------------------------------------------
 
 // --------------------------- INPUTS --------------------------------
@@ -113,6 +122,9 @@ input bool   ForceIndicatorAppliedPriceClose = true;
 input bool   UseTestDateRange = false;
 input datetime TestFromDate = D'2025.08.01 00:00';
 input datetime TestToDate   = D'2025.11.10 23:59';
+
+input bool   UseTrailingStop = false;  // Activate/Deactivate trailing stop
+input double TrailingStopMinImprovement = 1.0;  // ATR multiplier - minimum profit before trailing stop activates
 
 // --------------------------- DEBUG FILE NAMES -----------------------
 string DEBUG_FILENAME  = "wavecrest_debug_struct.csv";
@@ -298,14 +310,14 @@ bool WriteToAllFiles(string csvRow, string rawRow)
 
    if(StringLen(csvRow) > 0)
    {
-      if(fh_local_struct != INVALID_HANDLE) { w = (FileWriteString(fh_local_struct, csvRow) > 0); FileFlush(fh_local_struct); ok &= w; } else ok &= WriteStructuredRowOneShot(csvRow);
-      if(fh_common_struct!= INVALID_HANDLE) { w = (FileWriteString(fh_common_struct, csvRow) > 0); FileFlush(fh_common_struct); ok &= w; } else ok &= WriteStructuredRowOneShot(csvRow);
+      if(fh_local_struct != INVALID_HANDLE) { w = (FileWriteString(fh_local_struct, csvRow) > 0); FileFlush(fh_local_struct); ok = ok && w; } else ok = ok && WriteStructuredRowOneShot(csvRow);
+      if(fh_common_struct!= INVALID_HANDLE) { w = (FileWriteString(fh_common_struct, csvRow) > 0); FileFlush(fh_common_struct); ok = ok && w; } else ok = ok && WriteStructuredRowOneShot(csvRow);
    }
 
    if(StringLen(rawRow) > 0)
    {
-      if(fh_local_raw != INVALID_HANDLE) { w = (FileWriteString(fh_local_raw, rawRow) > 0); FileFlush(fh_local_raw); ok &= w; } else ok &= WriteRawRowOneShot(rawRow);
-      if(fh_common_raw!= INVALID_HANDLE) { w = (FileWriteString(fh_common_raw, rawRow) > 0); FileFlush(fh_common_raw); ok &= w; } else ok &= WriteRawRowOneShot(rawRow);
+      if(fh_local_raw != INVALID_HANDLE) { w = (FileWriteString(fh_local_raw, rawRow) > 0); FileFlush(fh_local_raw); ok = ok && w; } else ok = ok && WriteRawRowOneShot(rawRow);
+      if(fh_common_raw!= INVALID_HANDLE) { w = (FileWriteString(fh_common_raw, rawRow) > 0); FileFlush(fh_common_raw); ok = ok && w; } else ok = ok && WriteRawRowOneShot(rawRow);
    }
 
    if(!ok) PrintFormat("WaveCrestEA DIAG: WriteToAllFiles some writes failed GetLastError=%d", GetLastError());
@@ -495,6 +507,34 @@ void WriteInitSnapshot()
    WriteToAllFiles(decCsv, decRaw);
 }
 
+// --------------------------- BAR SHIFT HELPER -----------------------
+int GetBarShift(string symbol, ENUM_TIMEFRAMES timeframe, datetime time)
+{
+   // MQL5 doesn't have iBarShift, so we implement it using Bars
+   // Returns the shift (index) of the bar with the specified time
+   // Returns -1 if the bar is not found
+   
+   if(time < 0) return -1;
+   
+   datetime time_arr[];
+   ArraySetAsSeries(time_arr, true);
+   
+   // Copy a reasonable number of bars to search through
+   int copied = CopyTime(symbol, timeframe, 0, MAX_BARS_TO_SEARCH, time_arr);
+   if(copied <= 0) return -1;
+   
+   // Find the bar with time <= requested time (closest bar not newer than requested time)
+   for(int i = 0; i < copied; i++)
+   {
+      if(time_arr[i] <= time)
+      {
+         return i;
+      }
+   }
+   
+   return -1; // Not found
+}
+
 // --------------------------- BATCH PROCESSING -----------------------
 void BatchProcessRange(datetime from_time, datetime to_time)
 {
@@ -511,15 +551,15 @@ void BatchProcessRange(datetime from_time, datetime to_time)
       to_time = tmp;
    }
 
-   int shiftFrom = iBarShift(_Symbol, PERIOD_CURRENT, from_time, false);
-   int shiftTo   = iBarShift(_Symbol, PERIOD_CURRENT, to_time,   false);
+   int shiftFrom = GetBarShift(_Symbol, PERIOD_CURRENT, from_time);
+   int shiftTo   = GetBarShift(_Symbol, PERIOD_CURRENT, to_time);
 
    if(shiftFrom < 0 || shiftTo < 0)
    {
       PrintFormat("WaveCrestEA DIAG: BatchProcessRange: iBarShift failed shiftFrom=%d shiftTo=%d", shiftFrom, shiftTo);
       // fallback via CopyRates scan
       MqlRates tmpRates[];
-      int copied = CopyRates(_Symbol, PERIOD_CURRENT, 0, 5000, tmpRates);
+      int copied = CopyRates(_Symbol, PERIOD_CURRENT, 0, MAX_BARS_TO_SEARCH, tmpRates);
       if(copied <= 0) { Print("WaveCrestEA DIAG: BatchProcessRange fallback CopyRates failed"); return; }
       int foundFrom=-1, foundTo=-1;
       for(int i=0;i<copied;i++)
@@ -790,6 +830,97 @@ void OnDeinit(const int reason)
    if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
    if(rsiHandle != INVALID_HANDLE) IndicatorRelease(rsiHandle);
    PrintFormat("WaveCrestEA DIAG: Deinit reason=%d", reason);
+}
+
+// --------------------------- TRAILING STOP --------------------------
+void ManageTrailingStop()
+{
+   if(!UseTrailingStop) return;
+   
+   // Get current ATR for calculating distances
+   double atr = 0.0;
+   if(atrHandle != INVALID_HANDLE)
+   {
+      double atrBuf[];
+      int ac = CopyBuffer(atrHandle, 0, 1, 1, atrBuf);
+      if(ac > 0) atr = atrBuf[0];
+   }
+   if(atr <= 0.0) return;  // Can't calculate trailing stop without ATR
+   
+   double minImprovement = atr * TrailingStopMinImprovement;
+   double trailDistance = atr * ATR_Multiplier;
+   
+   // Loop through all open positions
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      // Check if position is for our symbol
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      
+      double posOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double posSL = PositionGetDouble(POSITION_SL);
+      double posTP = PositionGetDouble(POSITION_TP);
+      long posType = PositionGetInteger(POSITION_TYPE);
+      double currentPrice = (posType == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      bool shouldModify = false;
+      double newSL = posSL;
+      
+      if(posType == POSITION_TYPE_BUY)
+      {
+         // For buy positions, price must be above open + minImprovement
+         double profitDistance = currentPrice - posOpenPrice;
+         if(profitDistance >= minImprovement)
+         {
+            // Calculate new trailing stop
+            double proposedSL = currentPrice - trailDistance;
+            
+            // Only move SL up, never down
+            if(proposedSL > posSL)
+            {
+               newSL = proposedSL;
+               shouldModify = true;
+            }
+         }
+      }
+      else if(posType == POSITION_TYPE_SELL)
+      {
+         // For sell positions, price must be below open - minImprovement
+         double profitDistance = posOpenPrice - currentPrice;
+         if(profitDistance >= minImprovement)
+         {
+            // Calculate new trailing stop
+            double proposedSL = currentPrice + trailDistance;
+            
+            // Only move SL down, never up (for sell, lower is better)
+            if(proposedSL < posSL || posSL == 0.0)
+            {
+               newSL = proposedSL;
+               shouldModify = true;
+            }
+         }
+      }
+      
+      if(shouldModify)
+      {
+         // Normalize the price
+         newSL = NormalizeDouble(newSL, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+         
+         if(trade.PositionModify(ticket, newSL, posTP))
+         {
+            if(PrintTradeInfo)
+               PrintFormat("WaveCrestEA: Trailing stop adjusted for ticket %I64u, new SL=%.5f", ticket, newSL);
+         }
+         else
+         {
+            if(PrintTradeInfo)
+               PrintFormat("WaveCrestEA: Failed to modify trailing stop for ticket %I64u, error=%d", ticket, GetLastError());
+         }
+      }
+   }
 }
 
 // Handle deals to track consecutive losses
@@ -1087,5 +1218,8 @@ void OnTick()
    }
 
    barsSinceLastEntry++;
+   
+   // Manage trailing stops for open positions
+   ManageTrailingStop();
 }
 //+------------------------------------------------------------------+
