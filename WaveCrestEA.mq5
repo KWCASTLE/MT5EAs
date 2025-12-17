@@ -1,8 +1,9 @@
 //+------------------------------------------------------------------+
-//| WaveCrestEA v1.88 - Fixed MQL5 compilation errors                |
-//| - Replaced iBarShift with custom GetBarShift function            |
-//| - Fixed boolean operator from &= to && for proper logical ops    |
-//| - Added MAX_BARS_TO_SEARCH constant for maintainability          |
+//| WaveCrestEA v1.89 - Added Trailing Stop Functionality            |
+//| - Added trailing stop with min improvement threshold             |
+//| - UseTrailingStop input to enable/disable feature                |
+//| - TrailingStopMinImprovement: ATR multiplier for activation      |
+//| - Fixed MQL5 compilation errors (iBarShift, boolean operators)   |
 //| - Use MathAbs(...) for ordering / overshoot comparisons (magnitude)
 //| - Use only sign of main & hist to decide buy vs sell (positive=>sell, negative=>buy)
 //| - Make init snapshot symmetric for buy and sell emergences
@@ -11,7 +12,7 @@
 //| - Add temporary testing toggles: ForcePassOrderingGap, ForceMinLots
 //+------------------------------------------------------------------+
 #property copyright "WaveCrestEA"
-#property version   "1.88"
+#property version   "1.89"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -84,6 +85,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 bool WaitForMacdMainAndSignal(int closedOffset, int needCount, int maxAttempts, int sleepMs);
 string TimeStampOrNA(datetime t);
 int GetBarShift(string symbol, ENUM_TIMEFRAMES timeframe, datetime time);
+void ManageTrailingStop();
 // --------------------------------------------------------------------
 
 // --------------------------- INPUTS --------------------------------
@@ -120,6 +122,9 @@ input bool   ForceIndicatorAppliedPriceClose = true;
 input bool   UseTestDateRange = false;
 input datetime TestFromDate = D'2025.08.01 00:00';
 input datetime TestToDate   = D'2025.11.10 23:59';
+
+input bool   UseTrailingStop = false;  // Activate/Deactivate trailing stop
+input double TrailingStopMinImprovement = 1.0;  // ATR multiplier - minimum profit before trailing stop activates
 
 // --------------------------- DEBUG FILE NAMES -----------------------
 string DEBUG_FILENAME  = "wavecrest_debug_struct.csv";
@@ -827,6 +832,97 @@ void OnDeinit(const int reason)
    PrintFormat("WaveCrestEA DIAG: Deinit reason=%d", reason);
 }
 
+// --------------------------- TRAILING STOP --------------------------
+void ManageTrailingStop()
+{
+   if(!UseTrailingStop) return;
+   
+   // Get current ATR for calculating distances
+   double atr = 0.0;
+   if(atrHandle != INVALID_HANDLE)
+   {
+      double atrBuf[];
+      int ac = CopyBuffer(atrHandle, 0, 1, 1, atrBuf);
+      if(ac > 0) atr = atrBuf[0];
+   }
+   if(atr <= 0.0) return;  // Can't calculate trailing stop without ATR
+   
+   double minImprovement = atr * TrailingStopMinImprovement;
+   double trailDistance = atr * ATR_Multiplier;
+   
+   // Loop through all open positions
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      // Check if position is for our symbol
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      
+      double posOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double posSL = PositionGetDouble(POSITION_SL);
+      double posTP = PositionGetDouble(POSITION_TP);
+      long posType = PositionGetInteger(POSITION_TYPE);
+      double currentPrice = (posType == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      bool shouldModify = false;
+      double newSL = posSL;
+      
+      if(posType == POSITION_TYPE_BUY)
+      {
+         // For buy positions, price must be above open + minImprovement
+         double profitDistance = currentPrice - posOpenPrice;
+         if(profitDistance >= minImprovement)
+         {
+            // Calculate new trailing stop
+            double proposedSL = currentPrice - trailDistance;
+            
+            // Only move SL up, never down
+            if(proposedSL > posSL)
+            {
+               newSL = proposedSL;
+               shouldModify = true;
+            }
+         }
+      }
+      else if(posType == POSITION_TYPE_SELL)
+      {
+         // For sell positions, price must be below open - minImprovement
+         double profitDistance = posOpenPrice - currentPrice;
+         if(profitDistance >= minImprovement)
+         {
+            // Calculate new trailing stop
+            double proposedSL = currentPrice + trailDistance;
+            
+            // Only move SL down, never up (for sell, lower is better)
+            if(proposedSL < posSL || posSL == 0.0)
+            {
+               newSL = proposedSL;
+               shouldModify = true;
+            }
+         }
+      }
+      
+      if(shouldModify)
+      {
+         // Normalize the price
+         newSL = NormalizeDouble(newSL, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+         
+         if(trade.PositionModify(ticket, newSL, posTP))
+         {
+            if(PrintTradeInfo)
+               PrintFormat("WaveCrestEA: Trailing stop adjusted for ticket %I64u, new SL=%.5f", ticket, newSL);
+         }
+         else
+         {
+            if(PrintTradeInfo)
+               PrintFormat("WaveCrestEA: Failed to modify trailing stop for ticket %I64u, error=%d", ticket, GetLastError());
+         }
+      }
+   }
+}
+
 // Handle deals to track consecutive losses
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
@@ -1122,5 +1218,8 @@ void OnTick()
    }
 
    barsSinceLastEntry++;
+   
+   // Manage trailing stops for open positions
+   ManageTrailingStop();
 }
 //+------------------------------------------------------------------+
