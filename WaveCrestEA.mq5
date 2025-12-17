@@ -1,5 +1,8 @@
 //+------------------------------------------------------------------+
-//| WaveCrestEA v1.87 - ensure magnitude-based ordering comparisons  |
+//| WaveCrestEA v1.88 - Fixed MQL5 compilation errors                |
+//| - Replaced iBarShift with custom GetBarShift function            |
+//| - Fixed boolean operator from &= to && for proper logical ops    |
+//| - Added MAX_BARS_TO_SEARCH constant for maintainability          |
 //| - Use MathAbs(...) for ordering / overshoot comparisons (magnitude)
 //| - Use only sign of main & hist to decide buy vs sell (positive=>sell, negative=>buy)
 //| - Make init snapshot symmetric for buy and sell emergences
@@ -8,7 +11,7 @@
 //| - Add temporary testing toggles: ForcePassOrderingGap, ForceMinLots
 //+------------------------------------------------------------------+
 #property copyright "WaveCrestEA"
-#property version   "1.87"
+#property version   "1.88"
 #property strict
 
 #include <Trade\Trade.mqh>
