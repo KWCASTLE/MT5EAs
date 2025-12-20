@@ -251,12 +251,10 @@ void ManageTrailingStop()
       double a[];
       ArraySetAsSeries(a, true);
       int copied = CopyBuffer(atrHandle, 0, 0, 2, a);
-      if(copied >= 2 && ArraySize(a) >= 2) 
+      if(copied >= 2) 
          atr = a[1];
-      else if(copied < 2)
-         return; // Cannot proceed without valid ATR
    }
-   if(atr <= 0.0) return;
+   if(atr <= 0.0) return; // Cannot proceed without valid ATR
    
    double minImprovement = atr * ATR_Mult; // Minimum improvement threshold
    double trailingDistance = atr * TrailingStop_ATR_Mult; // Trailing stop distance
@@ -305,7 +303,7 @@ void ManageTrailingStop()
       if(trailingStopActivated)
       {
          double newSL = currentPrice + trailingDistance;
-         if(newSL < positionSL - PointSize() * MIN_SL_MOVEMENT_POINTS || positionSL == 0.0) // Only move SL down
+         if(newSL < positionSL - PointSize() * MIN_SL_MOVEMENT_POINTS) // Only move SL down
          {
             if(trade.PositionModify(positionTicket, newSL, positionTP))
             {
