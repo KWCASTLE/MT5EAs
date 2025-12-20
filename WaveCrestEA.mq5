@@ -1,8 +1,8 @@
 //+------------------------------------------------------------------+
-//| WaveCrestEA v1.227 - Fixed OnTradeTransaction for loss detection |
+//| WaveCrestEA v1.228 - Added Trailing Stop Feature                |
 //+------------------------------------------------------------------+
 #property copyright "WaveCrestEA"
-#property version   "1.227"
+#property version   "1.228"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -21,6 +21,8 @@ input double LossMultiplier   = 1.05;      // Multiplier applied per consecutive
 input double GapPct           = 0.04;
 input double RSI_Buy_Th       = 50.0;
 input double RSI_Sell_Th      = 50.0;
+input bool   Enable_TrailingStop = false; // Enable/disable trailing stop feature
+input double TrailingStop_ATR_Mult = 1.5;  // ATR multiplier for trailing stop distance
 
 const bool UseGlobalGuard   = true;
 const bool ClearGVOnInit    = true;
@@ -41,6 +43,9 @@ int lastFiredArmID = 0;
 int consecutiveLosses = 0;
 ulong lastPositionTicket = 0;
 bool positionWasOpen = false;
+bool trailingStopActivated = false; // Track if trailing stop has been activated
+double positionOpenPrice = 0.0;     // Store position open price
+bool positionIsBuy = false;         // Track if position is buy or sell
 
 string ts(datetime t)
 {
@@ -171,6 +176,11 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 
    double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
    
+   // Reset trailing stop state when position closes
+   trailingStopActivated = false;
+   positionOpenPrice = 0.0;
+   positionIsBuy = false;
+   
    if(profit < 0.0)
    {
       consecutiveLosses++;
@@ -186,8 +196,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 
 int OnInit()
 {
-   PrintFormat("WaveCrestEA v1.227 init - RiskPercent=%.1f%% FixedLot=%.2f MaxDoublings=%d LossMultiplier=%.1f", 
-               RiskPercent, FixedLot, MaxDoublings, LossMultiplier);
+   PrintFormat("WaveCrestEA v1.228 init - RiskPercent=%.1f%% FixedLot=%.2f MaxDoublings=%d LossMultiplier=%.1f Enable_TrailingStop=%d", 
+               RiskPercent, FixedLot, MaxDoublings, LossMultiplier, Enable_TrailingStop);
    if(ClearGVOnInit)
    {
       string gv1 = GvNameLastOrder();
@@ -202,6 +212,9 @@ int OnInit()
    armedBuy = false;
    armedSell = false;
    consecutiveLosses = 0;
+   trailingStopActivated = false;
+   positionOpenPrice = 0.0;
+   positionIsBuy = false;
    positionWasOpen = PositionSelect(_Symbol);
    if(! ClearGVOnInit && GlobalVariableCheck(GvNameLastFiredArm()))
       lastFiredArmID = (int)GlobalVariableGet(GvNameLastFiredArm());
@@ -219,8 +232,91 @@ void OnDeinit(const int reason)
 
 void OnTimer() { OnTick(); }
 
+void ManageTrailingStop()
+{
+   if(!Enable_TrailingStop) return;
+   if(!PositionSelect(_Symbol)) return;
+   
+   double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+   double positionSL = PositionGetDouble(POSITION_SL);
+   double positionTP = PositionGetDouble(POSITION_TP);
+   ulong positionTicket = PositionGetInteger(POSITION_TICKET);
+   long posType = PositionGetInteger(POSITION_TYPE);
+   
+   // Get current ATR
+   double atr = 0.0;
+   if(atrHandle != INVALID_HANDLE)
+   {
+      double a[];
+      ArraySetAsSeries(a, true);
+      if(CopyBuffer(atrHandle, 0, 0, 2, a) > 0) atr = a[1];
+   }
+   if(atr <= 0.0) return;
+   
+   double minImprovement = atr * ATR_Mult; // Minimum improvement threshold
+   double trailingDistance = atr * TrailingStop_ATR_Mult; // Trailing stop distance
+   
+   if(posType == POSITION_TYPE_BUY)
+   {
+      // Check if price has moved past minimum improvement level
+      if(!trailingStopActivated)
+      {
+         if(currentPrice >= positionOpenPrice + minImprovement)
+         {
+            trailingStopActivated = true;
+            PrintFormat("%s TRAILING_STOP_ACTIVATED (BUY): price=%.5f openPrice=%.5f minImprovement=%.5f",
+                       ts(TimeCurrent()), currentPrice, positionOpenPrice, minImprovement);
+         }
+      }
+      
+      // If trailing stop is activated, adjust SL
+      if(trailingStopActivated)
+      {
+         double newSL = currentPrice - trailingDistance;
+         if(newSL > positionSL + PointSize() * 10) // Only move SL up
+         {
+            if(trade.PositionModify(positionTicket, newSL, positionTP))
+            {
+               PrintFormat("%s TRAILING_SL_UPDATED (BUY): oldSL=%.5f newSL=%.5f currentPrice=%.5f",
+                          ts(TimeCurrent()), positionSL, newSL, currentPrice);
+            }
+         }
+      }
+   }
+   else if(posType == POSITION_TYPE_SELL)
+   {
+      // Check if price has moved past minimum improvement level
+      if(!trailingStopActivated)
+      {
+         if(currentPrice <= positionOpenPrice - minImprovement)
+         {
+            trailingStopActivated = true;
+            PrintFormat("%s TRAILING_STOP_ACTIVATED (SELL): price=%.5f openPrice=%.5f minImprovement=%.5f",
+                       ts(TimeCurrent()), currentPrice, positionOpenPrice, minImprovement);
+         }
+      }
+      
+      // If trailing stop is activated, adjust SL
+      if(trailingStopActivated)
+      {
+         double newSL = currentPrice + trailingDistance;
+         if(newSL < positionSL - PointSize() * 10 || positionSL == 0.0) // Only move SL down
+         {
+            if(trade.PositionModify(positionTicket, newSL, positionTP))
+            {
+               PrintFormat("%s TRAILING_SL_UPDATED (SELL): oldSL=%.5f newSL=%.5f currentPrice=%.5f",
+                          ts(TimeCurrent()), positionSL, newSL, currentPrice);
+            }
+         }
+      }
+   }
+}
+
 void OnTick()
 {
+   // Manage trailing stop on every tick
+   ManageTrailingStop();
+   
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
    if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 3, rates) < 3) return;
@@ -386,6 +482,11 @@ void OnTick()
                lastFiredArmID = armToUse;
                GlobalVariableSet(GvNameLastOrder(), (double)closed);
                GlobalVariableSet(GvNameLastFiredArm(), (double)lastFiredArmID);
+               
+               // Store position information for trailing stop
+               trailingStopActivated = false;
+               positionOpenPrice = entry;
+               positionIsBuy = willBuy;
 
                if(willBuy)
                {
