@@ -26,6 +26,7 @@ input double TrailingStop_ATR_Mult = 1.5;  // ATR multiplier for trailing stop d
 
 const bool UseGlobalGuard   = true;
 const bool ClearGVOnInit    = true;
+const int MIN_SL_MOVEMENT_POINTS = 10; // Minimum points SL must move to update
 
 int macdHandle = INVALID_HANDLE;
 int atrHandle  = INVALID_HANDLE;
@@ -249,7 +250,11 @@ void ManageTrailingStop()
    {
       double a[];
       ArraySetAsSeries(a, true);
-      if(CopyBuffer(atrHandle, 0, 0, 2, a) > 0) atr = a[1];
+      int copied = CopyBuffer(atrHandle, 0, 0, 2, a);
+      if(copied >= 2 && ArraySize(a) >= 2) 
+         atr = a[1];
+      else if(copied < 2)
+         return; // Cannot proceed without valid ATR
    }
    if(atr <= 0.0) return;
    
@@ -273,7 +278,7 @@ void ManageTrailingStop()
       if(trailingStopActivated)
       {
          double newSL = currentPrice - trailingDistance;
-         if(newSL > positionSL + PointSize() * 10) // Only move SL up
+         if(newSL > positionSL + PointSize() * MIN_SL_MOVEMENT_POINTS) // Only move SL up
          {
             if(trade.PositionModify(positionTicket, newSL, positionTP))
             {
@@ -300,7 +305,7 @@ void ManageTrailingStop()
       if(trailingStopActivated)
       {
          double newSL = currentPrice + trailingDistance;
-         if(newSL < positionSL - PointSize() * 10 || positionSL == 0.0) // Only move SL down
+         if(newSL < positionSL - PointSize() * MIN_SL_MOVEMENT_POINTS || positionSL == 0.0) // Only move SL down
          {
             if(trade.PositionModify(positionTicket, newSL, positionTP))
             {
